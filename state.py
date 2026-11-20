@@ -36,6 +36,7 @@ class State:
     problem_sig: tuple | None = None                # 문제 지문 (기준월·고객층·대분류·실제방향). 레시피마다 같아야 함
     datasets: dict[str, dict] = field(default_factory=dict)  # 레시피 이름 → 변수표 (검증용 dev / 봉인된 test)
     subcat_stats: pd.DataFrame | None = None        # 1~5월 소분류 통계 (묶음 만들기 참고용)
+    mid_table: pd.DataFrame | None = None           # 중분류합산 모델용 고객층×중분류×월 표 (거래를 빼지 않음, 레시피 무관)
     prechecks: list[dict] = field(default_factory=list)      # 사전 점검 기록 (신호등)
 
     # ---- [3] model_agent 가 채움 ----

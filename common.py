@@ -265,9 +265,13 @@ def adoption_test(y, months, p_old, p_new, rule: dict, seed: int) -> dict:
     win = paired_win_rate(y, p_old, p_new, rule["부트스트랩_횟수"], seed)
     up_months = 0
     per_month = {}
+    acc = rule.get("월별_비교_지표", "macro_f1") == "정답률"     # ③을 월별 정답률로 볼지, 월별 Macro-F1로 볼지
+
+    def month_score(t, p):
+        return float((t == p).mean()) if acc else macro_f1(t, p)
     for m in sorted(set(months.tolist())):
         k = months == m
-        a, b = macro_f1(y[k], np.asarray(p_old)[k]), macro_f1(y[k], np.asarray(p_new)[k])
+        a, b = month_score(y[k], np.asarray(p_old)[k].astype(int)), month_score(y[k], np.asarray(p_new)[k].astype(int))
         per_month[int(m)] = (round(a, 4), round(b, 4))
         up_months += int(b > a)
     ok1 = win >= rule["부트스트랩_승률"]
@@ -276,6 +280,6 @@ def adoption_test(y, months, p_old, p_new, rule: dict, seed: int) -> dict:
     reasons = []
     reasons.append(f"부트스트랩 승률 {win:.0%} ({'통과' if ok1 else '미달'}, 기준 {rule['부트스트랩_승률']:.0%})")
     reasons.append(f"상승폭 {f_new - f_old:+.3f} ({'통과' if ok2 else '미달'}, 기준 +{rule['최소상승폭']})")
-    reasons.append(f"상승 월 {up_months}/{len(per_month)} ({'통과' if ok3 else '미달'}, 기준 {rule['최소상승월수']})")
+    reasons.append(f"{'정답률' if acc else 'F1'} 상승 월 {up_months}/{len(per_month)} ({'통과' if ok3 else '미달'}, 기준 {rule['최소상승월수']})")
     return {"채택": bool(ok1 and ok2 and ok3), "기존F1": round(f_old, 4), "새F1": round(f_new, 4),
             "승률": round(win, 3), "상승월수": up_months, "월별": per_month, "이유": " / ".join(reasons)}

@@ -23,6 +23,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from common import adoption_test, is_on, macro_f1
+from agents import bottomup, calendar_model, problem_lookup
 from agents.data_agent import periods
 
 
@@ -103,7 +104,10 @@ def _cat(p, seed):
 MODEL_BUILDERS = {"로지스틱회귀": _lr, "로지스틱_L1": _lr, "선형판별분석": _lda, "SGD": _sgd, "나이브베이즈": _nb,
                   "최근접이웃": _knn, "서포트벡터머신": _svm, "결정나무": _tree, "랜덤포레스트": _rf,
                   "엑스트라트리": _et, "LightGBM": _lgbm, "히스트그래디언트부스팅": _hgb, "신경망": _mlp,
-                  "XGBoost": _xgb, "CatBoost": _cat}
+                  "XGBoost": _xgb, "CatBoost": _cat,
+                  bottomup.NAME: None, calendar_model.NAME: None}   # 이 둘은 make_pipeline에서 따로 만듦
+# 행 → 문제 대응표(problem_lookup)를 쓰는 후보: 본 프로세스에서만 돌릴 수 있음
+LOOKUP_MODELS = (bottomup.NAME, calendar_model.NAME)
 _PACKAGE = {"XGBoost": "xgboost", "CatBoost": "catboost", "LightGBM": "lightgbm"}
 
 
@@ -156,6 +160,12 @@ def onehot_idx(ds: dict) -> tuple:
 def make_pipeline(cfg, model: str, params: dict, recipe: dict, seed: int, skip: tuple = ()) -> Pipeline:
     m = cfg["후보모델"][model]
     p = {**(m.get("고정설정") or {}), **params}
+    if model == bottomup.NAME:      # 극단값·표준화는 모델 안에서 중분류 칸 기준으로 처리
+        return Pipeline([("model", bottomup.MidSumClassifier(**p, 극단값_상한=bool(recipe["전처리"]["극단값_상한"]),
+                                                             data_name=recipe["이름"], seed=seed))])
+    if model == calendar_model.NAME:
+        return Pipeline([("model", calendar_model.CalendarDirectionClassifier(
+            **p, 공휴일=tuple(str(d) for d in cfg["달력"]["공휴일"]), data_name=recipe["이름"]))])
     steps = []
     if recipe["전처리"]["극단값_상한"]:
         steps.append(("clip", QuantileClip()))
@@ -194,6 +204,15 @@ def _eval_candidate(cfg, model, params, recipe, X, y, fold_list, seed, skip=()):
     return np.concatenate(proba)
 
 
+def _available(model: str, recipe: dict) -> bool:
+    """중분류합산·달력방향은 레시피의 자료(문제 대응표, 중분류 표)가 있어야 돌 수 있다."""
+    if model == bottomup.NAME:
+        return bottomup.info(recipe["이름"]) is not None
+    if model == calendar_model.NAME:
+        return problem_lookup.has(recipe["이름"])
+    return True
+
+
 def _grid(space: dict) -> list[dict]:
     keys = list(space)
     return [dict(zip(keys, v)) for v in itertools.product(*[space[k] for k in keys])] or [{}]
@@ -229,8 +248,14 @@ def evaluate(state, ds: dict, recipe: dict) -> dict:
             tasks = [(m, p) for m, grid in state.search_plan.items() for p in grid]
         else:
             tasks = [(m, p) for m in used for p in _grid(cfg["후보모델"][m]["좁은범위"])]
+        tasks = [(m, p) for m, p in tasks if _available(m, recipe)]
+        # 문제 대응표를 쓰는 후보는 자료를 이 프로세스에 들고 있어서 병렬 작업자 대신 여기서 바로 돌림
+        par = [(m, p) for m, p in tasks if m not in LOOKUP_MODELS]
+        here = [(m, p) for m, p in tasks if m in LOOKUP_MODELS]
         probs = Parallel(n_jobs=cfg["탐색"]["병렬_작업수"])(
-            delayed(_eval_candidate)(cfg, m, p, recipe, X, y, fl, seed, skip) for m, p in tasks)
+            delayed(_eval_candidate)(cfg, m, p, recipe, X, y, fl, seed, skip) for m, p in par)
+        probs += [_eval_candidate(cfg, m, p, recipe, X, y, fl, seed, skip) for m, p in here]
+        tasks = par + here
     else:
         tasks, probs = _optuna(cfg, used, recipe, X, y, fl, yv, seed, skip)
     state.n_validations += len(tasks) * len(fl)
@@ -404,6 +429,8 @@ def _optuna(cfg, used, recipe, X, y, fl, yv, seed, skip=()):
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     tasks, probs = [], []
     for m in used:
+        if not _available(m, recipe):
+            continue
         wide = cfg["후보모델"][m]["넓은범위"] or {}
 
         def objective(trial, m=m, wide=wide):

@@ -10,6 +10,7 @@ import duckdb
 import numpy as np
 import pandas as pd
 
+from agents import bottomup, problem_lookup
 from common import SafeError, is_on, month_add, month_range, slog, write_csv
 
 UNIT = ["sex", "age_band", "cat_l"]          # 고객층(성별·연령구간) × 대분류 = 시계열 하나
@@ -160,6 +161,10 @@ def build(state, recipe: dict) -> dict:
         cal = _calendar(cfg, P["all"])
         for col in cal.columns:
             put(f"다음달_{col}", main["crym"].map(cal[col]), "달력변수")
+    if v.get("달력차이"):
+        cd = _calendar_diff(cfg, P["all"])
+        for col in cd.columns:
+            put(f"달력차이_{col}", main["crym"].map(cd[col]), "달력차이")
     if (n == 0).any():
         put("거래없음", (n == 0).astype(float), "거래없음")
 
@@ -228,12 +233,32 @@ def build(state, recipe: dict) -> dict:
 
     meta = prob[KEYS + ["label", "rate_next", "last_dir"]]
     test = prob["crym"].isin(P["test"])
-    return {
+    out = {
         "이름": recipe["이름"], "cols": cols, "groups": {c: groups[c] for c in cols}, "상수라뺀변수": const,
         "dev": {"X": X.loc[dev, cols].reset_index(drop=True), "meta": meta[dev].reset_index(drop=True)},
         "sealed": {"X": X.loc[test, cols].reset_index(drop=True), "meta": meta[test].reset_index(drop=True)},
         "panel": main[KEYS + ["am", "ct", "n"]], "묶음비중": bundle_share,
     }
+    X_all = np.vstack([out["dev"]["X"].to_numpy(float), out["sealed"]["X"].to_numpy(float)])
+    keys = pd.concat([out["dev"]["meta"][KEYS], out["sealed"]["meta"][KEYS]], ignore_index=True)
+    why = problem_lookup.register(out["이름"], X_all, keys)        # 행 → 문제 대응 (달력방향·중분류합산 후보가 씀)
+    if why:
+        out["문제대응"] = why
+    if is_on(cfg["후보모델"].get(bottomup.NAME, {}).get("사용")):
+        _register_mid(state, out, stat, min_ct)
+    return out
+
+
+def _register_mid(state, ds: dict, stat: list[int], min_ct: float):
+    """중분류합산 후보가 쓸 중분류 표를 이 레시피의 변수표와 묶어 둔다 (중분류 표는 원본 전체로 한 번만 만듦)."""
+    cfg = state.config
+    if state.mid_table is None:
+        con = _con(state)
+        mid = _agg(con, cfg, ["cat_m"], "clean")
+        con.close()
+        state.mid_table = bottomup.build_table(mid, KEYS, UNIT, periods(cfg)["all"], stat, min_ct)
+    why = bottomup.register(ds["이름"], state.mid_table, KEYS)
+    ds["중분류합산"] = bottomup.info(ds["이름"]) or {"사용불가": why}
 
 
 def _sq(s: str) -> str:
@@ -265,6 +290,27 @@ def _calendar(cfg, months) -> pd.DataFrame:
         rows[m] = {"영업일수": sum(d.weekday() < 5 and d.date() not in hol for d in days),
                    "명절": float(any(a <= d <= b for d in days for a, b in fest)),
                    "소비쿠폰": float(any(not (b < days[0] or a > days[-1]) for a, b in coup))}
+    return pd.DataFrame.from_dict(rows, orient="index")
+
+
+def _calendar_diff(cfg, months) -> pd.DataFrame:
+    """기준월 t → t+1월이 t월보다 며칠 긴지 (일수·영업일수·휴일수·토일수·소비쿠폰 일수의 차이).
+
+    정답이 '월 합계'라 다음 달이 길면 늘기 쉽다. 미리 알 수 있는 달력이라 누수가 아니다.
+    """
+    hol = {pd.Timestamp(d).date() for d in cfg["달력"]["공휴일"]}
+    coup = [(pd.Timestamp(a), pd.Timestamp(b)) for a, b in cfg["달력"]["소비쿠폰기간"].values()]
+
+    def one(m):
+        first = pd.Timestamp(m // 100, m % 100, 1)
+        d = pd.date_range(first, periods=first.days_in_month)
+        off = sum(x.weekday() >= 5 or x.date() in hol for x in d)
+        return {"일수": len(d), "영업일수": len(d) - off, "휴일수": off, "토일수": sum(x.weekday() >= 5 for x in d),
+                "쿠폰일수": sum(any(a <= x <= b for a, b in coup) for x in d)}
+    rows = {}
+    for m in months:
+        a, b = one(m), one(month_add(m, 1))
+        rows[m] = {k: float(b[k] - a[k]) for k in a}
     return pd.DataFrame.from_dict(rows, orient="index")
 
 

@@ -15,8 +15,9 @@ import pandas as pd
 from sklearn.inspection import permutation_importance
 from sklearn.metrics import balanced_accuracy_score, confusion_matrix, precision_recall_fscore_support
 
+from agents import bottomup
 from agents.data_agent import periods
-from agents.model_agent import make_pipeline, onehot_idx, proba1
+from agents.model_agent import LOOKUP_MODELS, make_pipeline, onehot_idx, proba1
 from common import SafeError, bootstrap_f1, cfg_path, macro_f1, month_add, write_csv
 
 
@@ -166,8 +167,11 @@ def _importance(state, pipes, ds, res, recipe, yt) -> pd.DataFrame:
     Xd, md = ds["dev"]["X"].to_numpy(float), ds["dev"]["meta"]
     yd = md["label"].to_numpy().astype(int)
     out = pd.DataFrame({"변수": cols, "묶음": [ds["groups"][c] for c in cols]})
-    pi = permutation_importance(pipes[0], Xt, yt, scoring="f1_macro", n_repeats=10, random_state=seed, n_jobs=1)
-    out["순열중요도(테스트)"] = pi.importances_mean.round(4)
+    if res["모델"] in LOOKUP_MODELS:    # 중분류합산·달력방향은 행 값을 섞으면 문제를 찾을 수 없어 순열 중요도를 못 냄
+        out["순열중요도(테스트)"] = np.nan
+    else:
+        pi = permutation_importance(pipes[0], Xt, yt, scoring="f1_macro", n_repeats=10, random_state=seed, n_jobs=1)
+        out["순열중요도(테스트)"] = pi.importances_mean.round(4)
     bbm = res["best_by_model"]
     if "로지스틱회귀" in bbm:
         lr = make_pipeline(cfg, "로지스틱회귀", bbm["로지스틱회귀"]["설정"], recipe, seed, onehot_idx(ds)).fit(Xd, yd)

@@ -8,8 +8,8 @@
   1. 정답표 금액이 결과/01_집계/panel_monthly.csv 와 1원 단위로 같은가
   2. 테스트 Macro-F1이 결과/02_baseline/test_scores.csv 의 로지스틱 점수와 같은가
 
-    ..\\.venv\\Scripts\\python tools\\reproduce_baseline.py                 실데이터 (원본을 읽음: 사용자 요청 시에만 실행)
-    ..\\.venv\\Scripts\\python tools\\reproduce_baseline.py --raw <가짜.csv> 가짜데이터로 동작만 확인 (비교 대상 없음)
+    .venv\\Scripts\\python tools\\reproduce_baseline.py                 실데이터 (원본을 읽음: 사용자 요청 시에만 실행)
+    .venv\\Scripts\\python tools\\reproduce_baseline.py --raw <가짜.csv> 가짜데이터로 동작만 확인 (비교 대상 없음)
 화면과 결과에는 집계값(점수·불일치 칸 수)만 출력한다.
 """
 import argparse

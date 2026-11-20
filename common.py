@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
-ROOT = Path(__file__).resolve().parent          # AutoML-AGENT 폴더
+ROOT = Path(__file__).resolve().parent          # 저장소 최상위 폴더
 YES = {"예", "켜기", "항상", True}              # 설정 파일에서 '참'으로 보는 값
 
 
@@ -21,7 +21,7 @@ class SafeError(Exception):
 
 # ---------------------------------------------------------------- .env (API 키)
 def load_dotenv(path: Path = ROOT / ".env"):
-    """AutoML-AGENT/.env 의 '이름=값' 줄을 환경변수로 읽는다. 이미 설정된 환경변수는 덮어쓰지 않는다.
+    """저장소 최상위 .env 의 '이름=값' 줄을 환경변수로 읽는다. 이미 설정된 환경변수는 덮어쓰지 않는다.
     값(키)은 화면이나 로그에 절대 출력하지 않는다. .env 는 .gitignore로 GitHub에 올라가지 않는다."""
     import os
     if not path.exists():
@@ -56,7 +56,7 @@ def load_config(path: str | Path) -> dict:
 
 
 def cfg_path(cfg: dict, key: str) -> Path:
-    """설정의 경로 값을 AutoML-AGENT 폴더 기준 절대경로로."""
+    """설정의 경로 값을 저장소 최상위 폴더 기준 절대경로로."""
     p = Path(cfg["경로"][key])
     return p if p.is_absolute() else (ROOT / p).resolve()
 
@@ -147,7 +147,7 @@ def check_config(cfg: dict) -> tuple[list[str], list[str]]:
         err.append(f"LLM > 모드는 규칙 / ollama / openai 중 하나여야 합니다. (지금 값: {mode})")
     import os
     if mode == "openai" and not os.environ.get("OPENAI_API_KEY"):
-        warn.append("LLM > openai 모드인데 OPENAI_API_KEY가 없습니다 (AutoML-AGENT/.env 확인). 규칙 모드로 대신 실행합니다.")
+        warn.append("LLM > openai 모드인데 OPENAI_API_KEY가 없습니다 (저장소 최상위의 .env 확인). 규칙 모드로 대신 실행합니다.")
     return err, warn
 
 

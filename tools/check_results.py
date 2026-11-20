@@ -3,8 +3,8 @@
 보안 폴더의 지역 대응표(region_codes.csv)에 있는 이름이 결과 폴더의 파일에 나오는지 센다.
 이름 자체는 화면에 출력하지 않고 '발견 n건'과 파일 이름만 출력한다.
 
-    ..\\.venv\\Scripts\\python tools\\check_results.py                 실데이터 결과 (결과/03_agent)
-    ..\\.venv\\Scripts\\python tools\\check_results.py --fake          가짜데이터 결과 (결과/테스트_agent)
+    .venv\\Scripts\\python tools\\check_results.py                 실데이터 결과 (결과/03_agent)
+    .venv\\Scripts\\python tools\\check_results.py --fake          가짜데이터 결과 (결과/테스트_agent)
 """
 import argparse
 import sys

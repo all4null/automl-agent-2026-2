@@ -1,6 +1,6 @@
 """가짜데이터로 에이전트의 안전장치를 자동 점검한다 (계획서 Verification).
 
-    ..\\.venv\\Scripts\\python tools\\self_test.py
+    .venv\\Scripts\\python tools\\self_test.py
 
 확인 항목
   1. 원본 행을 지우지 않았나 (검산: 행 수·금액 1원 단위 일치)

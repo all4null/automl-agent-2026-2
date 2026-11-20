@@ -8,9 +8,9 @@
   - 세금 같은 비소비성 소분류가 특정 달에 크게 튐
   - 일부러 넣은 이상값: 범주 밖 성별·연령, 대분류 결측, 쉼표 붙은 금액, 전각 공백
 
-실행 (AutoML-AGENT 폴더에서):
-    ..\\.venv\\Scripts\\python tools\\make_fake_raw.py --rows 300000
-    ..\\.venv\\Scripts\\python tools\\make_fake_raw.py --rows 300000 --encoding cp949 --out ../데이터/가짜데이터/fake_raw_cp949.csv
+실행 (저장소 최상위 폴더에서):
+    .venv\\Scripts\\python tools\\make_fake_raw.py --rows 300000
+    .venv\\Scripts\\python tools\\make_fake_raw.py --rows 300000 --encoding cp949 --out ../데이터/가짜데이터/fake_raw_cp949.csv
 """
 import argparse
 from pathlib import Path

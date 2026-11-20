@@ -1,10 +1,10 @@
 """AutoML-Agent 실행 버튼. 이 파일만 읽어도 전체 흐름이 보인다.
 
-실행 (AutoML-AGENT 폴더에서, 프로젝트의 가상환경 사용):
-    ..\\.venv\\Scripts\\python run.py --check                 설정 요약과 오류만 확인 (학습 안 함)
-    ..\\.venv\\Scripts\\python run.py                         config.yaml의 원본으로 전체 실행
-    ..\\.venv\\Scripts\\python run.py --raw <가짜원본.csv>     원본 경로를 바꿔 실행 (가짜데이터 시험용)
-    ..\\.venv\\Scripts\\python run.py --replay <실행폴더>      이전 실행의 LLM 답을 그대로 다시 써서 재현
+실행 (저장소 최상위 폴더에서, 폴더 안의 가상환경 .venv 사용):
+    .venv\\Scripts\\python run.py --check                 설정 요약과 오류만 확인 (학습 안 함)
+    .venv\\Scripts\\python run.py                         config.yaml의 원본으로 전체 실행
+    .venv\\Scripts\\python run.py --raw <가짜원본.csv>     원본 경로를 바꿔 실행 (가짜데이터 시험용)
+    .venv\\Scripts\\python run.py --replay <실행폴더>      이전 실행의 LLM 답을 그대로 다시 써서 재현
 """
 from __future__ import annotations
 

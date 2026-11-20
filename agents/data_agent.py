@@ -10,7 +10,7 @@ import duckdb
 import numpy as np
 import pandas as pd
 
-from agents import bottomup, problem_lookup
+from agents import bottomup, problem_lookup, timeseries_models
 from common import SafeError, is_on, month_add, month_range, slog, write_csv
 
 UNIT = ["sex", "age_band", "cat_l"]          # 고객층(성별·연령구간) × 대분류 = 시계열 하나
@@ -83,6 +83,7 @@ def build_truth(state):
     keep_same = int((panel["crym"].isin(base_months) & panel["label"].isna()).sum())
     panel["sex_nm"] = panel["sex"].map({str(k): v for k, v in cfg["성별"].items()})
     state.truth = panel
+    timeseries_models.set_panel(panel)          # 칼만필터 등 시계열 후보가 쓰는 칸×월 금액 (기준월까지만 잘라 씀)
     state.quality["유지_건수"] = keep_same                                      # 계획서 5-1: 금액이 같아 빠진 문제 수
     write_csv(panel.drop(columns=["am_prev"]), state.run_dir / "panel_truth.csv")
     n = panel.groupby(panel["crym"].map(lambda m: "검증" if m in P["valid"] else "테스트" if m in P["test"]
@@ -165,6 +166,21 @@ def build(state, recipe: dict) -> dict:
         cd = _calendar_diff(cfg, P["all"])
         for col in cd.columns:
             put(f"달력차이_{col}", main["crym"].map(cd[col]), "달력차이")
+    if v.get("일수보정"):
+        # 월 합계는 달 길이에 따라 커지므로, 하루 평균으로 바꿔 '진짜 변화'와 '날짜 수 효과'를 나눈다
+        def dim(m):
+            return float(pd.Timestamp(m // 100, m % 100, 1).days_in_month)
+        d0 = main["crym"].map(dim).to_numpy()
+        d1 = main["crym"].map(lambda m: dim(month_add(int(m), -1))).to_numpy()
+        dn = main["crym"].map(lambda m: dim(month_add(int(m), 1))).to_numpy()
+        put("하루평균_금액", L(am / d0), "일수보정")
+        put("하루평균_전월대비", np.where(am1 > 0, (am / d0) / (am1 / d1).where(am1 > 0) - 1, 0.0), "일수보정")
+        put("다음달_일수차이", dn - d0, "일수보정")
+    if v.get("칼만예측"):
+        # 칼만 상태공간 모델이 기준월까지의 금액만으로 낸 '다음 달 예상 변화(로그)'를 변수로 (스태킹)
+        idx = pd.MultiIndex.from_frame(main[["sex", "age_band", "cat_l", "crym"]])
+        for mdl in ["수준", "공통요인"]:
+            put(f"칼만예측_{mdl}", timeseries_models.kalman_delta(mdl, 1.0).reindex(idx).fillna(0).to_numpy(), "칼만예측")
     if (n == 0).any():
         put("거래없음", (n == 0).astype(float), "거래없음")
 

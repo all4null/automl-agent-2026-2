@@ -23,7 +23,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from common import adoption_test, is_on, macro_f1
-from agents import bottomup, calendar_model, problem_lookup
+from agents import bottomup, calendar_model, problem_lookup, timeseries_models
 from agents.data_agent import periods
 
 
@@ -105,9 +105,10 @@ MODEL_BUILDERS = {"로지스틱회귀": _lr, "로지스틱_L1": _lr, "선형판�
                   "최근접이웃": _knn, "서포트벡터머신": _svm, "결정나무": _tree, "랜덤포레스트": _rf,
                   "엑스트라트리": _et, "LightGBM": _lgbm, "히스트그래디언트부스팅": _hgb, "신경망": _mlp,
                   "XGBoost": _xgb, "CatBoost": _cat,
-                  bottomup.NAME: None, calendar_model.NAME: None}   # 이 둘은 make_pipeline에서 따로 만듦
+                  bottomup.NAME: None, calendar_model.NAME: None,   # 아래 후보들은 make_pipeline에서 따로 만듦
+                  **{n: None for n in timeseries_models.NAMES}}
 # 행 → 문제 대응표(problem_lookup)를 쓰는 후보: 본 프로세스에서만 돌릴 수 있음
-LOOKUP_MODELS = (bottomup.NAME, calendar_model.NAME)
+LOOKUP_MODELS = (bottomup.NAME, calendar_model.NAME) + timeseries_models.NAMES
 _PACKAGE = {"XGBoost": "xgboost", "CatBoost": "catboost", "LightGBM": "lightgbm"}
 
 
@@ -163,6 +164,8 @@ def make_pipeline(cfg, model: str, params: dict, recipe: dict, seed: int, skip: 
     if model == bottomup.NAME:      # 극단값·표준화는 모델 안에서 중분류 칸 기준으로 처리
         return Pipeline([("model", bottomup.MidSumClassifier(**p, 극단값_상한=bool(recipe["전처리"]["극단값_상한"]),
                                                              data_name=recipe["이름"], seed=seed))])
+    if model in timeseries_models.NAMES:   # 칼만필터·시변계수·최근가중: 표준화 등은 모델 안에서 처리
+        return Pipeline([("model", timeseries_models.build(model, p, recipe))])
     if model == calendar_model.NAME:
         return Pipeline([("model", calendar_model.CalendarDirectionClassifier(
             **p, 공휴일=tuple(str(d) for d in cfg["달력"]["공휴일"]), data_name=recipe["이름"]))])
@@ -208,7 +211,7 @@ def _available(model: str, recipe: dict) -> bool:
     """중분류합산·달력방향은 레시피의 자료(문제 대응표, 중분류 표)가 있어야 돌 수 있다."""
     if model == bottomup.NAME:
         return bottomup.info(recipe["이름"]) is not None
-    if model == calendar_model.NAME:
+    if model == calendar_model.NAME or model in timeseries_models.NAMES:
         return problem_lookup.has(recipe["이름"])
     return True
 
@@ -320,7 +323,7 @@ def evaluate(state, ds: dict, recipe: dict) -> dict:
 
 
 # ---------------------------------------------------------------- 모델 담당의 생각 (LLM): 탐색 계획
-MAX_PER_MODEL, MAX_TOTAL = 12, 100
+MAX_PER_MODEL, MAX_TOTAL = 12, 130
 
 
 def _space_info(cfg, used) -> list[dict]:

@@ -11,8 +11,64 @@ import pandas as pd
 
 import llm
 from agents import data_agent, model_agent
-from agents.planner import apply_change, change_desc, change_label, describe, menu_changes
+from agents.planner import DESC as DESC_VARS, apply_change, change_desc, change_label, describe, menu_changes
 from common import adoption_test, write_csv, write_json
+
+
+# ---------------------------------------------------------------- 진단·평가 설계 (모델을 돌리기 전)
+def diagnose(state):
+    """데이터 구조를 진단하고 이번 실행의 평가 방식·개선안을 정한다. 모델 점수를 보기 전에 한 번만 정한다."""
+    import math
+    from agents import diagnosis
+    cfg = state.config
+    if not llm.is_on((cfg.get("진단") or {}).get("사용", "예")):
+        return state
+    d = diagnosis.run_all(state)
+    default = diagnosis.rule_decision(cfg, d)
+    var_menu = [k for k, v in cfg["변수"].items() if llm.is_on(v.get("시험")) and v.get("처음값") != "항상"]
+    models = [m for m, v in cfg["후보모델"].items() if llm.is_on(v.get("사용"))]
+    opts = [o["검증월_수"] for o in d["평가_선택지"]]
+    data = {"진단": d, "변수_메뉴": {k: DESC_VARS.get(k, "") for k in var_menu}, "후보모델_목록": models,
+            "기준모델": cfg["기준모델"], "규칙의_기본_판단": default}
+    tools = {"업종별_달효과": {"인자": "", "설명": "업종마다 '다음 달이 더 김' 여부에 따른 증가 비율 (기준월 ~ validation 마지막 달)",
+                            "함수": lambda a: diagnosis.category_month_effect(state)}}
+
+    def ok(a):
+        if not isinstance(a, dict):
+            return False, "형식 오류"
+        if a.get("검증월_수") not in opts:
+            return False, f"검증월_수는 {opts} 중 하나"
+        if a.get("부트스트랩_단위") not in ("달", "문제") or a.get("테스트_방식") not in ("고정", "매달재학습"):
+            return False, "부트스트랩_단위 또는 테스트_방식 값 오류"
+        on, off = a.get("켤_변수", []), a.get("끌_후보모델", [])
+        if not (isinstance(on, list) and len(on) <= 4 and all(k in var_menu for k in on)):
+            return False, "켤_변수가 메뉴 밖이거나 4개 초과"
+        if not (isinstance(off, list) and len(off) <= 5 and all(m in models and m != cfg["기준모델"] for m in off)):
+            return False, "끌_후보모델이 목록 밖이거나 기준모델 포함"
+        return True, ""
+
+    ans, who = llm.ask(state, "진단·평가 설계", "diagnose.md", data, default, ok, tools)
+    # 반영 (이번 실행의 설정에만. config.yaml 파일은 바꾸지 않음)
+    n = int(ans["검증월_수"])
+    chosen = next(o for o in d["평가_선택지"] if o["검증월_수"] == n)
+    cfg["기간"]["검증월"] = chosen["검증월"]
+    cfg["판단규칙"]["부트스트랩_단위"] = ans["부트스트랩_단위"]
+    cfg["판단규칙"]["최소상승월수"] = n // 2 + 1                       # 달 수가 바뀌면 '과반 달에서 상승'으로 맞춤
+    for k in ans.get("켤_변수", []):
+        cfg["변수"][k]["처음값"] = "켜기"
+    for m in ans.get("끌_후보모델", []):
+        cfg["후보모델"][m]["사용"] = "아니오"
+    cfg["평가"]["테스트_방식"] = ans["테스트_방식"]
+    state.diagnosis = {"진단": d, "결정": ans, "결정자": who}
+    state.decide("⑤ 검토", "진단·평가 설계", f"달효과 {d['달_효과']['달효과_비율']}, 같은 달 신호 부호 바뀜 "
+                 f"{d['같은달_신호']['부호가_바뀐_횟수']}회, 상한(달/달×업종) {d['정보_상한']['상한_F1']['달']}/"
+                 f"{d['정보_상한']['상한_F1']['달×업종']}",
+                 f"validation {n}개월({chosen['검증월'][0] % 100}~{chosen['검증월'][-1] % 100}월), 부트스트랩 {ans['부트스트랩_단위']} 단위, "
+                 f"test {ans['테스트_방식']}, 켬 {ans.get('켤_변수', [])}, 끔 {ans.get('끌_후보모델', [])}", who, ans.get("이유", ""))
+    state.log(f"[5] 검토 담당 진단: 달효과 {d['달_효과']['달효과_비율']:.2f}, 일수 규칙 {d['달_효과']['일수규칙_맞은달']}, "
+              f"같은 달 신호 부호 바뀜 {d['같은달_신호']['부호가_바뀐_횟수']}회 → validation {n}개월 · 부트스트랩 "
+              f"{ans['부트스트랩_단위']} 단위 · test {ans['테스트_방식']} ({who})")
+    return state
 
 
 # ---------------------------------------------------------------- 처음 레시피 A·B 비교
@@ -163,7 +219,8 @@ def review_plan(state, A: dict, ans: dict, who: str, menu: list, names: list) ->
 def adoption_rule_text(cfg) -> str:
     r = cfg["판단규칙"]
     n = len(cfg["기간"]["검증월"])
-    return (f"새 레시피는 지금 레시피와 같은 검증 {48 * n}문제로 비교해 ① 문제를 다시 뽑아 채점한 {r['부트스트랩_횟수']}번 중 "
+    unit = "달을 통째로" if r.get("부트스트랩_단위") == "달" else "문제를"
+    return (f"새 레시피는 지금 레시피와 같은 검증 {48 * n}문제로 비교해 ① {unit} 다시 뽑아 채점한 {r['부트스트랩_횟수']}번 중 "
             f"{r['부트스트랩_승률']:.0%} 이상에서 이기고 ② 검증 Macro-F1이 {r['최소상승폭']} 이상 오르고 "
             f"③ 검증 {n}개월 중 {r['최소상승월수']}개월 이상에서 월별 {'정답률' if r.get('월별_비교_지표') == '정답률' else 'Macro-F1'}이 올라야 "
             f"채택된다. 하나라도 못 넘으면 기각.")
@@ -247,6 +304,7 @@ def report(state):
              "검증횟수": state.n_validations, "비교한_후보수": len(state.trials),
              "수정시도": [{k: v for k, v in r.items() if k != "precheck"} for r in state.revisions],
              "결정기록": state.decisions, "원본점검": state.quality, "LLM_해석": state.explanation,
+             "진단": state.diagnosis,
              "테스트": {k: v for k, v in (state.test or {}).items() if k not in ("표", "변수영향", "_preds")}}
     write_json(trace, d / "agent_trace.json")
     llm_out = {}

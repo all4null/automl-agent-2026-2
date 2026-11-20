@@ -58,6 +58,8 @@ class State:
     # ---- 모두 ----
     decisions: list[dict] = field(default_factory=list)       # 결정 기록: 단계 | 항목 | 후보 | 선택 | 결정자 | 이유
     llm_calls: list[dict] = field(default_factory=list)       # LLM 호출 기록 (AI 활용 내역)
+    llm_sessions: dict = field(default_factory=dict)          # 에이전트별 자기 대화 기록 (다른 에이전트는 못 봄)
+    diagnosis: dict | None = None                             # 검토 담당의 진단 결과와 평가 설계 결정 (모델 결과 보기 전)
     explanation: dict | None = None                 # [5] reviewer.report: LLM이 쓴 결과 해석 (LLM 모드일 때만)
     log: Any = None                                 # common.RunLog
 

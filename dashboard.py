@@ -141,6 +141,20 @@ def build(state, insights: dict):
 
     # 4. 결정 과정
     S.append('<h2 id="s4">4. 에이전트 결정 과정</h2>')
+    if state.diagnosis:      # 검토 담당의 진단 (모델을 돌리기 전, test 기간 정보 없음)
+        dg, dec = state.diagnosis["진단"], state.diagnosis["결정"]
+        S.append(f"<h3>진단·평가 설계 (검토 담당, 결정자: {state.diagnosis['결정자']})</h3>")
+        S.append(_table(_kv({"달효과 비율": dg["달_효과"]["달효과_비율"], "일수 규칙 맞은 달": dg["달_효과"]["일수규칙_맞은달"],
+                             "같은 달 신호 부호 바뀜": dg["같은달_신호"]["부호가_바뀐_횟수"],
+                             "같은 달 순위상관": dg["같은달_신호"]["달별_순위상관"],
+                             "정보 상한 (달 / 달×업종 / 달×고객층)": " / ".join(str(v) for v in dg["정보_상한"]["상한_F1"].values()),
+                             "달×업종 안 고객층 일치도": dg["단위_일치도"]["달×업종_안_고객층_일치도"],
+                             "→ validation 달 수": dec["검증월_수"], "→ 부트스트랩 단위": dec["부트스트랩_단위"],
+                             "→ test 채점 방식": dec["테스트_방식"], "→ 켠 파생변수": ", ".join(dec.get("켤_변수", [])) or "-",
+                             "→ 뺀 후보 모델": ", ".join(dec.get("끌_후보모델", [])) or "-",
+                             "주의점": " / ".join(dec.get("주의점", [])) or "-", "이유": dec.get("이유", "")})))
+        S.append("<h4>validation 선택지</h4>" + _table(pd.DataFrame(dg["평가_선택지"])))
+        S.append("<h4>달별 증가 비율과 다음 달 일수 차이</h4>" + _table(pd.DataFrame(dg["달_효과"]["달별"])))
     S.append(_table(pd.DataFrame(state.decisions)))
     S.append("<h3>레시피</h3>" + _table(pd.DataFrame([{"이름": k, "설명": v.get("설명", ""), "내용": describe(v),
                                                          "검증F1": state.results[k]["검증F1"] if k in state.results else None}

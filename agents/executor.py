@@ -47,7 +47,8 @@ def run(state):
     n_boot = cfg["평가"]["부트스트랩_횟수"]
     final, first = state.current, state.first_recipe
     state.exec_plan = _plan_monthly(state)          # 실행 담당: 테스트를 열기 전에 월별 갱신 실험 계획을 정함
-    log(f"[4] 테스트 개봉: 최종 레시피 {final}" + (f", 비교용 처음 레시피 {first}" if first != final else ""))
+    log(f"[4] 테스트 개봉: 최종 레시피 {final}" + (f", 비교용 처음 레시피 {first}" if first != final else "")
+        + f" (채점 방식: {(cfg.get('평가') or {}).get('테스트_방식', '고정')})")
 
     scored, models = {}, {}
     for name in dict.fromkeys([final, first]):
@@ -57,8 +58,21 @@ def run(state):
         yd = md["label"].to_numpy().astype(int)
         tr = _train_rows(md, recipe)
         pipes = _fit(cfg, res, recipe, Xd[tr], yd[tr], seed, onehot_idx(ds))
-        scored[name] = _proba(pipes, Xt)
         models[name] = pipes
+        if (cfg.get("평가") or {}).get("테스트_방식") == "매달재학습":
+            # test 달마다 그때까지 확정된 정답(3월 ~ 지난달)으로 다시 학습해 그 달만 예측 (실제 운영과 같은 방식)
+            Xa = np.vstack([Xd, Xt])
+            ma = pd.concat([md, mt], ignore_index=True)
+            ya = ma["label"].to_numpy().astype(int)
+            ca = ma["crym"].to_numpy()
+            p = np.zeros(len(mt))
+            for m in P["test"]:
+                trm = _train_rows(ma, recipe, ca < m)
+                k = mt["crym"].to_numpy() == m
+                p[k] = _proba(_fit(cfg, res, recipe, Xa[trm], ya[trm], seed, onehot_idx(ds)), Xt[k])
+            scored[name] = p
+        else:
+            scored[name] = _proba(pipes, Xt)
 
     ds, res, recipe = state.datasets[final], state.results[final], state.recipes[final]
     mt, md = ds["sealed"]["meta"], ds["dev"]["meta"]

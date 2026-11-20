@@ -244,10 +244,23 @@ def bootstrap_f1(y, p, n: int, seed: int) -> np.ndarray:
     return _f1_from_counts(tp, fp, fn, tn)
 
 
-def paired_win_rate(y, p_old, p_new, n: int, seed: int) -> float:
-    """같은 문제 묶음을 다시 뽑아 채점했을 때 새 예측이 기존 예측보다 '높은' 비율 (짝 비교)."""
+def paired_win_rate(y, p_old, p_new, n: int, seed: int, blocks=None) -> float:
+    """같은 문제 묶음을 다시 뽑아 채점했을 때 새 예측이 기존 예측보다 '높은' 비율 (짝 비교).
+
+    blocks(예: 기준월)를 주면 문제가 아니라 '달'을 통째로 다시 뽑는다 (달 단위 블록 부트스트랩).
+    같은 달 문제끼리 함께 움직일 때, 문제 단위로 뽑으면 근거를 실제보다 크게 센다.
+    """
     y, a, b = (np.asarray(v).astype(int) for v in (y, p_old, p_new))
-    idx = np.random.default_rng(seed).integers(0, len(y), size=(n, len(y)))
+    rng = np.random.default_rng(seed)
+    if blocks is not None:
+        groups = [np.where(np.asarray(blocks) == g)[0] for g in sorted(set(np.asarray(blocks).tolist()))]
+        pick = rng.integers(0, len(groups), size=(n, len(groups)))        # 매번 달을 '달 수만큼' 중복 허용으로 다시 뽑음
+        if len({len(g) for g in groups}) > 1:                              # 달마다 문제 수가 다르면 한 번씩 채점
+            sets = [np.concatenate([groups[j] for j in row]) for row in pick]
+            return float(np.mean([macro_f1(y[s], b[s]) > macro_f1(y[s], a[s]) for s in sets]))
+        idx = np.array([np.concatenate([groups[j] for j in row]) for row in pick])
+    else:
+        idx = rng.integers(0, len(y), size=(n, len(y)))
     Y, A, B = y[idx], a[idx], b[idx]
 
     def f1(P):
@@ -262,7 +275,8 @@ def adoption_test(y, months, p_old, p_new, rule: dict, seed: int) -> dict:
     """채택 규칙 (config 판단규칙): ① 짝 비교 부트스트랩 승률 ② 최소상승폭 ③ 최소상승월수. 모두 넘어야 채택."""
     y, months = np.asarray(y), np.asarray(months)
     f_old, f_new = macro_f1(y, p_old), macro_f1(y, p_new)
-    win = paired_win_rate(y, p_old, p_new, rule["부트스트랩_횟수"], seed)
+    by_month = rule.get("부트스트랩_단위", "문제") == "달"
+    win = paired_win_rate(y, p_old, p_new, rule["부트스트랩_횟수"], seed, months if by_month else None)
     up_months = 0
     per_month = {}
     acc = rule.get("월별_비교_지표", "macro_f1") == "정답률"     # ③을 월별 정답률로 볼지, 월별 Macro-F1로 볼지
@@ -278,7 +292,7 @@ def adoption_test(y, months, p_old, p_new, rule: dict, seed: int) -> dict:
     ok2 = (f_new - f_old) >= rule["최소상승폭"]
     ok3 = up_months >= rule["최소상승월수"]
     reasons = []
-    reasons.append(f"부트스트랩 승률 {win:.0%} ({'통과' if ok1 else '미달'}, 기준 {rule['부트스트랩_승률']:.0%})")
+    reasons.append(f"{'달 단위 ' if by_month else ''}부트스트랩 승률 {win:.0%} ({'통과' if ok1 else '미달'}, 기준 {rule['부트스트랩_승률']:.0%})")
     reasons.append(f"상승폭 {f_new - f_old:+.3f} ({'통과' if ok2 else '미달'}, 기준 +{rule['최소상승폭']})")
     reasons.append(f"{'정답률' if acc else 'F1'} 상승 월 {up_months}/{len(per_month)} ({'통과' if ok3 else '미달'}, 기준 {rule['최소상승월수']})")
     return {"채택": bool(ok1 and ok2 and ok3), "기존F1": round(f_old, 4), "새F1": round(f_new, 4),

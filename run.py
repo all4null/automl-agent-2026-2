@@ -89,8 +89,9 @@ def run_all(state, raw=None):
     from agents import data_agent, executor, model_agent, planner, raw_agent, reviewer
 
     raw_agent.run(state, raw)                         # [0] 원본 점검·정제 (원본을 읽는 유일한 단계)
-    raw_agent.review(state)                           # [0] 원본 담당 생각: 데이터 주의점, 소분류 묶음 후보 제안
     data_agent.build_truth(state)                     # [2] 정답표 (고정)
+    reviewer.diagnose(state)                          # [5] 검토 담당 생각: 진단 → 평가 설계·개선안 (모델 결과 보기 전, 이후 못 바꿈)
+    raw_agent.review(state)                           # [0] 원본 담당 생각: 데이터 주의점, 소분류 묶음 후보 제안
     planner.run(state)                                # [1] 계획 담당 생각: 레시피 B 제안 → [5] 검토 담당이 계획 검토
     model_agent.plan(state, state.datasets["A"], state.recipes["A"])   # [3] 모델 담당 생각: 탐색 계획 → A 검증 → 범위 조정
     model_agent.evaluate(state, state.datasets["B"], state.recipes["B"])  # [3] 같은 계획으로 B 검증

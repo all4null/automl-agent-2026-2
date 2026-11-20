@@ -1,0 +1,15 @@
+# 필수 (프로젝트 .venv에 이미 설치됨)
+duckdb>=1.1          # 원본 CSV 읽기, parquet 저장·조회 (pyarrow 없이 parquet 사용)
+pandas>=2.2
+numpy>=1.26
+pyyaml>=6.0
+scikit-learn>=1.5
+lightgbm>=4.0
+matplotlib>=3.8
+joblib
+
+# 선택 (설치하면 config.yaml에서 켤 수 있음)
+# optuna             # 탐색 > 방법: optuna
+# xgboost            # 후보모델 > XGBoost
+# catboost           # 후보모델 > CatBoost
+# LLM은 추가 패키지 없이 파이썬 기본 HTTP로 호출 (ollama·openai 공통)

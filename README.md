@@ -37,7 +37,7 @@
 
 LLM을 쓰려면:
 - **ollama** (이 컴퓨터 안에서 실행, 데이터가 밖으로 안 나감): ollama 앱을 켜고 `ollama pull qwen2.5:7b` 후 `모드: ollama`
-- **openai**: 환경변수 `OPENAI_API_KEY`를 설정하고 `모드: openai`. 키는 파일에 쓰지 않습니다.
+- **openai**: `.env.example`을 `.env`로 복사해 `OPENAI_API_KEY=` 뒤에 키를 쓰고 `모드: openai`. `.env`는 GitHub에 올라가지 않습니다 (이미 설정된 환경변수가 있으면 그쪽이 우선).
 - LLM에게는 업종 이름·집계 통계·검증 점수·지역 코드만 보냅니다. 연결이 안 되면 규칙 모드로 자동 대체됩니다.
 
 ## 3. 구조

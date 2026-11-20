@@ -19,8 +19,27 @@ class SafeError(Exception):
     """화면에 그대로 보여 줘도 되는 오류 (원본 데이터 내용이 들어 있지 않음)."""
 
 
+# ---------------------------------------------------------------- .env (API 키)
+def load_dotenv(path: Path = ROOT / ".env"):
+    """AutoML-AGENT/.env 의 '이름=값' 줄을 환경변수로 읽는다. 이미 설정된 환경변수는 덮어쓰지 않는다.
+    값(키)은 화면이나 로그에 절대 출력하지 않는다. .env 는 .gitignore로 GitHub에 올라가지 않는다."""
+    import os
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key = key.strip().removeprefix("export ").strip()
+        val = val.strip().strip('"').strip("'")
+        if key and val and key not in os.environ:
+            os.environ[key] = val
+
+
 # ---------------------------------------------------------------- 설정
 def load_config(path: str | Path) -> dict:
+    load_dotenv()
     path = Path(path)
     if not path.is_absolute():
         path = ROOT / path
@@ -128,7 +147,7 @@ def check_config(cfg: dict) -> tuple[list[str], list[str]]:
         err.append(f"LLM > 모드는 규칙 / ollama / openai 중 하나여야 합니다. (지금 값: {mode})")
     import os
     if mode == "openai" and not os.environ.get("OPENAI_API_KEY"):
-        warn.append("LLM > openai 모드인데 환경변수 OPENAI_API_KEY가 없습니다. 규칙 모드로 대신 실행합니다.")
+        warn.append("LLM > openai 모드인데 OPENAI_API_KEY가 없습니다 (AutoML-AGENT/.env 확인). 규칙 모드로 대신 실행합니다.")
     return err, warn
 
 

@@ -11,7 +11,7 @@ import pandas as pd
 
 import llm
 from agents import data_agent, model_agent
-from agents.planner import apply_change, change_label, describe, menu_changes
+from agents.planner import apply_change, change_desc, change_label, describe, menu_changes
 from common import adoption_test, write_csv, write_json
 
 
@@ -42,12 +42,14 @@ def check(state):
         if not menu:
             log("[5] 더 시험할 수정안이 없습니다")
             break
-        change, who, why = _pick(state, menu)
+        change, who, why = _pick(state, menu, max_try - n_try)
         tried.add(_key(change))
         name = f"R{len(state.revisions) + 1}"
         new = apply_change(cur, change, name)
+        new = data_agent.decide_details(state, new, change)                         # 데이터 담당: 분해 변수 개수
         ds_new = data_agent.build(state, new)
         pc = data_agent.precheck(state, ds_new, state.datasets[state.current], change)
+        pc = data_agent.judge_precheck(state, pc, change_label(change), max_try - n_try)   # 데이터 담당: 🟢를 진행할지
         n_pc += 1
         rec = {"번호": name, "기준레시피": state.current, "수정안": change_label(change), "결정자": who, "제안이유": why,
                "사전점검": pc["신호등"], "사전점검_이유": " / ".join(pc["이유"]), "결과": pc["판정"], "precheck": pc}
@@ -109,7 +111,8 @@ def _bundle_candidates(state) -> list[dict]:
     if drv:
         out.append({"종류": "묶음", "묶음": {"이름": "변동주도", "소분류": drv, "처리": "분리",
                                           "이유": f"1~5월 같은 대분류 안 월 변화의 {th:.0%} 이상을 만든 소분류"}})
-    for name, items in (cfg["소분류처리"].get("힌트") or {}).items():
+    hints = state.hints or (cfg["소분류처리"].get("힌트") or {})    # 설정 힌트 + 원본 담당이 제안한 후보
+    for name, items in hints.items():
         subs = [s for s in items if s in have]
         if subs:
             for how in ("분리", "제외"):
@@ -117,17 +120,80 @@ def _bundle_candidates(state) -> list[dict]:
     return out
 
 
-def _pick(state, menu: list[dict]):
+def _preview(state, menu, num):
+    """검토 담당의 도구: 수정안 하나를 사전 점검만 해 본다."""
+    try:
+        c = menu[int(num)]
+    except (TypeError, ValueError, IndexError):
+        return {"오류": "번호가 목록 밖"}
+    cur = state.recipes[state.current]
+    ds = data_agent.build(state, apply_change(cur, c, "미리보기"))
+    pc = data_agent.precheck(state, ds, state.datasets[state.current], c)
+    top = sorted(pc["신호"].items(), key=lambda kv: -abs(kv[1] - 0.5))[:5]
+    return {"수정안": change_label(c), "신호등": pc["신호등"], "이유": pc["이유"], "신호_상위5(AUC)": dict(top)}
+
+
+def review_plan(state, A: dict, ans: dict, who: str, menu: list, names: list) -> dict:
+    """검토 담당이 계획 담당의 레시피 B 제안을 검토한다. 승인하거나, 메뉴 안에서 고친다."""
+    from agents.planner import _signal_preview, DESC
+    data = {"레시피A": describe(A), "계획_담당_제안": {"켤_항목": ans["켤_항목"], "이유": ans.get("이유", ""), "결정자": who},
+            "메뉴": [{"항목": c["항목"], "설명": DESC.get(c["항목"], "")} for c in menu],
+            "학습_문제_수": "3~5월 144개 (검증 3회차 중 가장 적을 때)"}
+    tools = {"변수_신호": {"인자": "항목", "설명": "A에 그 항목을 켰을 때의 사전 점검 결과와 새 변수 신호",
+                         "함수": lambda a: _signal_preview(state, A, menu, a.get("항목"))}}
+
+    def ok(r):
+        if not isinstance(r, dict) or not isinstance(r.get("승인"), bool):
+            return False, "승인 값이 true/false가 아님"
+        if r["승인"]:
+            return True, ""
+        items = r.get("고친_켤_항목")
+        good = isinstance(items, list) and 1 <= len(items) <= 4 and all(i in names for i in items)
+        return good, "" if good else "고친 항목이 메뉴 밖이거나 개수가 1~4개가 아님"
+
+    r, who2 = llm.ask(state, "계획 검토", "plan_review.md", data, {"승인": True, "이유": "검토 생략 (규칙)"}, ok, tools)
+    if r["승인"]:
+        state.decide("① 계획", "계획 검토", ", ".join(ans["켤_항목"]), "승인", who2, r.get("이유", ""))
+        return ans
+    state.decide("① 계획", "계획 검토", ", ".join(ans["켤_항목"]), "수정: " + ", ".join(r["고친_켤_항목"]), who2, r.get("이유", ""))
+    state.log(f"[5] 검토 담당이 계획을 고침: {ans['켤_항목']} → {r['고친_켤_항목']}")
+    return {"켤_항목": r["고친_켤_항목"], "이유": f"{ans.get('이유', '')} / 검토 수정: {r.get('이유', '')}"}
+
+
+def adoption_rule_text(cfg) -> str:
+    r = cfg["판단규칙"]
+    n = len(cfg["기간"]["검증월"])
+    return (f"새 레시피는 지금 레시피와 같은 검증 {48 * n}문제로 비교해 ① 문제를 다시 뽑아 채점한 {r['부트스트랩_횟수']}번 중 "
+            f"{r['부트스트랩_승률']:.0%} 이상에서 이기고 ② 검증 Macro-F1이 {r['최소상승폭']} 이상 오르고 "
+            f"③ 검증 {n}개월 중 {r['최소상승월수']}개월 이상에서 올라야 채택된다. 하나라도 못 넘으면 기각.")
+
+
+def _pick(state, menu: list[dict], remaining: int):
     """다음 수정안 고르기. 규칙 모드는 목록 순서(계획서 4-2), LLM 모드는 LLM이 메뉴에서 고르거나 묶음을 만든다."""
     default = {"번호": 0, "이유": "계획서 4-2 순서대로 아직 안 해 본 첫 수정안 (규칙)"}
+    cfg = state.config
     st = data_agent.subcat_stats(state)
     have = set(st["소분류"])
     cur = state.results[state.current]
-    data = {"지금_레시피": describe(state.recipes[state.current]), "지금_검증F1": cur["검증F1"], "월별F1": cur["월별F1"],
-            "지난_시도": [{k: r.get(k) for k in ["수정안", "사전점검", "사전점검_이유", "결과", "기존F1", "새F1"]} for r in state.revisions],
-            "남은_수정안": [{"번호": i, "수정안": change_label(c)} for i, c in enumerate(menu)],
-            "소분류_통계": st.sort_values("대분류변화기여도", ascending=False).head(60).to_dict("records"),
-            "묶음_최대": state.config["소분류처리"]["묶음_최대"]}
+    data = {"지금_레시피": describe(state.recipes[state.current]), "지금_검증F1": cur["검증F1"],
+            "지금_검증_월별F1": cur["월별F1"], "비교용_규칙_검증F1": cur["규칙F1"],
+            "채택_규칙": adoption_rule_text(cfg),
+            "남은_시도_횟수": f"{remaining}회 (사전 점검에서 🟡 건너뜀·🔴 탈락이면 횟수를 쓰지 않음)",
+            "사전점검_의미": "모델 학습 전에 3~5월 학습 데이터만 보고 거름. 🔴 데이터가 망가짐, 🟡 바뀐 게 거의 없거나 정답과 관련 신호가 약함",
+            "지난_시도": [{k: r.get(k) for k in ["수정안", "제안이유", "사전점검", "사전점검_이유", "결과", "기존F1", "새F1", "채택판단"]}
+                         for r in state.revisions],
+            "남은_수정안": [{"번호": i, "수정안": change_label(c), "설명": change_desc(c)} for i, c in enumerate(menu)],
+            "소분류_통계_설명": "1~5월 기준. 금액비중=전체 지출 중 비율, 월변동계수=월별 금액의 흔들림, "
+                                "대분류변화기여도=같은 대분류 안 월 변화량 중 이 소분류 몫(대분류마다 합 1), 가맹점1위시도비중=한 시도에 몰린 정도",
+            "소분류_통계_대분류변화기여도_상위15": st.sort_values("대분류변화기여도", ascending=False).head(15).to_dict("records"),
+            "원본_담당의_주의점": (state.data_review or {}).get("데이터_주의점", []),
+            "묶음_최대": cfg["소분류처리"]["묶음_최대"], "지금_묶음_수": len(state.recipes[state.current]["묶음"])}
+    tools = {
+        "소분류_통계": {"인자": "대분류", "설명": "그 대분류의 모든 소분류 통계 (1~5월)",
+                       "함수": lambda a: st[st["소분류"].str.startswith(str(a.get("대분류", "")) + " > ")].to_dict("records")},
+        "수정안_미리보기": {"인자": "번호", "설명": "남은_수정안 하나의 사전 점검 결과(🟢🟡🔴, 이유, 새 변수 신호). 검증 시도 횟수를 쓰지 않음",
+                         "함수": lambda a: _preview(state, menu, a.get("번호"))},
+    }
 
     def ok(ans):
         if not isinstance(ans, dict):
@@ -142,9 +208,10 @@ def _pick(state, menu: list[dict]):
             b["소분류"] = subs
             b["이름"] = str(b.get("이름") or "LLM묶음")[:20]
             return True, ""
-        return (isinstance(ans.get("번호"), int) and 0 <= ans["번호"] < len(menu)), "번호가 목록 밖"
+        ok_num = isinstance(ans.get("번호"), int) and 0 <= ans["번호"] < len(menu)
+        return ok_num, "" if ok_num else "번호가 목록 밖"
 
-    ans, who = llm.ask(state, "다음 수정안", "reviewer.md", data, default, ok)
+    ans, who = llm.ask(state, "다음 수정안", "reviewer.md", data, default, ok, tools)
     if "묶음" in ans:
         b = dict(ans["묶음"]); b["이유"] = ans.get("이유", "")
         return {"종류": "묶음", "묶음": b}, who, ans.get("이유", "")
@@ -172,12 +239,13 @@ def report(state):
     insights = _insights(state)
     write_csv(insights["업종월별"], d / "insight_category_monthly.csv")
     write_csv(insights["행사전후"], d / "insight_events.csv")
+    _explain(state, insights)
     recipes = {k: {**v, "요약": describe(v)} for k, v in state.recipes.items()}
     trace = {"실행": d.name, "시작": state.started_at, "LLM모드": llm.mode(state), "탐색방법": cfg["탐색"]["방법"],
              "레시피": recipes, "처음레시피": state.first_recipe, "최종레시피": state.current,
              "검증횟수": state.n_validations, "비교한_후보수": len(state.trials),
              "수정시도": [{k: v for k, v in r.items() if k != "precheck"} for r in state.revisions],
-             "결정기록": state.decisions, "원본점검": state.quality,
+             "결정기록": state.decisions, "원본점검": state.quality, "LLM_해석": state.explanation,
              "테스트": {k: v for k, v in (state.test or {}).items() if k not in ("표", "변수영향", "_preds")}}
     write_json(trace, d / "agent_trace.json")
     llm_out = {}
@@ -189,6 +257,45 @@ def report(state):
     dashboard.build_index(d.parent.parent)
     state.log(f"[5] 보고서: {d / 'report.html'}")
     return state
+
+
+def _explain(state, insights: dict):
+    """LLM이 결과 해석을 쓴다 (LLM 모드 + 맡길_일 > 결과_설명 이 켜진 경우만). 테스트 점수는 보내지 않는다."""
+    final = state.results[state.current]
+    coef = None
+    if state.test is not None and "로지스틱계수(표준화)" in state.test["변수영향"]:
+        fi = state.test["변수영향"]           # 로지스틱 계수는 3~8월 학습 데이터로 구한 값 (테스트 사용 안 함)
+        coef = fi.reindex(fi["로지스틱계수(표준화)"].abs().sort_values(ascending=False).index).head(10)[
+            ["변수", "로지스틱계수(표준화)"]].to_dict("records")
+    growth = insights["업종월별"].pivot_table(index="cat_l", columns="crym", values="전월대비%").round(1)
+    tried = {r["수정안"] for r in state.revisions}
+    untried = [f"{change_label(c)}: {change_desc(c)}" for c in menu_changes(state.config, state.recipes[state.current])
+               if change_label(c) not in tried]
+    data = {"과제": "고객층 6 × 업종 대분류 8의 다음 달 지출 증가/감소 예측. 검증은 6·7·8월 144문제",
+            "채택_규칙": adoption_rule_text(state.config),
+            "모델_선택_규칙": f"기준모델({state.config['기준모델']})을 위 채택 규칙으로 이긴 모델만 선택됨. "
+                              "그래서 검증 점수 1등 모델이 선택되지 않을 수 있음",
+            "아직_시험하지_않은_수정안": untried[:10],
+            "레시피": {k: {"내용": describe(v), "검증F1": state.results[k]["검증F1"] if k in state.results else None}
+                       for k, v in state.recipes.items()},
+            "처음레시피": state.first_recipe, "최종레시피": state.current,
+            "처음레시피_검증F1": state.results[state.first_recipe]["검증F1"],
+            "최종레시피_검증F1": final["검증F1"],
+            "최종모델": f"{final['모델']} {final['설정']}", "최종_검증_월별F1": final["월별F1"],
+            "규칙_검증F1": final["규칙F1"],
+            "모델별_검증F1_상위5": final["모델별"].head(5)[["모델", "검증F1"]].to_dict("records"),
+            "수정시도": [{k: r.get(k) for k in ["수정안", "결정자", "제안이유", "사전점검", "사전점검_이유", "결과", "기존F1", "새F1", "채택판단"]}
+                         for r in state.revisions],
+            "로지스틱_계수_상위10": coef,
+            "업종별_전월대비%": {c: {str(m): v for m, v in row.items() if v == v} for c, row in growth.iterrows()},
+            "명절·쿠폰_전후": insights["행사전후"].round(2).to_dict("records")}
+
+    def ok(ans):
+        good = isinstance(ans, dict) and isinstance(ans.get("요약"), str) and ans["요약"].strip()
+        return bool(good), "" if good else "요약 없음"
+
+    ans, who = llm.ask(state, "결과 설명", "explainer.md", data, None, ok)
+    state.explanation = {**ans, "결정자": who, "모델": llm.model_name(state)} if ans else None
 
 
 def _insights(state) -> dict:

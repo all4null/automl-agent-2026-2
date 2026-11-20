@@ -23,6 +23,9 @@ class State:
     # ---- [0] raw_agent 가 채움 ----
     clean_path: Path | None = None                  # 정제 원본 parquet 경로 (보안 폴더)
     quality: dict = field(default_factory=dict)     # 원본 점검 결과 요약 (집계값만)
+    data_review: dict | None = None                 # 원본 담당의 해석: 데이터 주의점, LLM이 제안한 소분류 후보 목록
+    hints: dict = field(default_factory=dict)       # 소분류 묶음 후보 목록 (config 힌트 + 원본 담당 제안)
+    search_plan: dict | None = None                 # [3] 모델 담당의 탐색 계획: 모델 → 하이퍼파라미터 범위 (모든 레시피에 같은 계획)
 
     # ---- [1] planner 가 채움 ----
     recipes: dict[str, dict] = field(default_factory=dict)   # 레시피 이름 → 레시피 (전처리·변수 선택 묶음)
@@ -48,10 +51,13 @@ class State:
     test: dict | None = None                        # 테스트 결과 (한 번만 채워짐)
     monthly: dict = field(default_factory=dict)     # 월별 갱신 실험 결과
     predictions: pd.DataFrame | None = None         # 예측표 (계획서 1-4 형식)
+    exec_plan: dict | None = None                   # 실행 담당의 월별 갱신 실험 계획 (테스트 전에 정함)
+    test_interpretation: dict | None = None         # 실행 담당의 테스트 해석 (테스트 후, 고르는 데 쓰지 않음)
 
     # ---- 모두 ----
     decisions: list[dict] = field(default_factory=list)       # 결정 기록: 단계 | 항목 | 후보 | 선택 | 결정자 | 이유
     llm_calls: list[dict] = field(default_factory=list)       # LLM 호출 기록 (AI 활용 내역)
+    explanation: dict | None = None                 # [5] reviewer.report: LLM이 쓴 결과 해석 (LLM 모드일 때만)
     log: Any = None                                 # common.RunLog
 
     def decide(self, 단계: str, 항목: str, 후보: str, 선택: str, 결정자: str, 이유: str):

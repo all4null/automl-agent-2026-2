@@ -39,8 +39,21 @@ def run(state):
         bad = [i for i in items if i not in names]
         return (not bad), (f"메뉴 밖 항목: {bad}" if bad else "")
 
-    ans, who = llm.ask(state, "처음 레시피 B", "planner.md",
-                       {"메뉴": names, "레시피A": describe(A), "업종": state.quality["업종"]["대분류"]}, default, ok)
+    from agents import data_agent, reviewer
+    state.recipes = {"A": A}
+    state.datasets["A"] = data_agent.build(state, A)
+    data = {"레시피A": describe(A), "레시피A_기본변수": [k for k, v in A["변수"].items() if v],
+            "메뉴": [{"항목": c["항목"], "설명": DESC.get(c["항목"], "")} for c in menu],
+            "업종_대분류": state.quality["업종"]["대분류"], "학습_문제_수": "3~5월 144개 (검증 3회차 중 가장 적을 때)",
+            "원본_담당의_주의점": (state.data_review or {}).get("데이터_주의점", [])}
+    tools = {
+        "변수_신호": {"인자": "항목 (메뉴의 항목 이름)", "설명": "A에 그 항목을 켰을 때의 사전 점검 결과(🟢🟡🔴)와 새 변수의 신호(3~5월 학습 데이터 기준)",
+                     "함수": lambda a: _signal_preview(state, A, menu, a.get("항목"))},
+        "업종별_추이": {"인자": "", "설명": "1~5월 업종 대분류별 월 지출 전월대비(%)",
+                      "함수": lambda a: _cat_trend(state)},
+    }
+    ans, who = llm.ask(state, "처음 레시피 B", "planner.md", data, default, ok, tools)
+    ans = reviewer.review_plan(state, A, ans, who, menu, names)   # 검토 담당이 계획을 검토 (승인 또는 수정)
     B = copy.deepcopy(A)
     B["이름"], B["설명"] = "B", "A + " + ", ".join(ans["켤_항목"])
     for c in menu:
@@ -48,11 +61,62 @@ def run(state):
             B = apply_change(B, c, "B")
     B["설명"] = "A + " + ", ".join(ans["켤_항목"])
     state.recipes = {"A": A, "B": B}
+    state.datasets["B"] = data_agent.build(state, B)
     state.first_recipe = "A"
     state.decide("① 계획", "처음 레시피 2개", f"A: {describe(A)} / B: {describe(B)}", "A와 B를 둘 다 검증", who, ans["이유"])
     log(f"[1] 처음 레시피 A: {describe(A)}")
     log(f"[1] 처음 레시피 B: {B['설명']} (결정: {who})")
     return state
+
+
+def _signal_preview(state, A, menu, item):
+    """계획 담당의 도구: A에 항목 하나를 켜 보고 사전 점검만 해 본다 (검증은 하지 않음)."""
+    from agents import data_agent
+    c = next((c for c in menu if c["항목"] == item), None)
+    if c is None:
+        return {"오류": f"메뉴에 없는 항목: {item}"}
+    ds = data_agent.build(state, apply_change(A, c, "미리보기"))
+    pc = data_agent.precheck(state, ds, state.datasets["A"], c)
+    top = sorted(pc["신호"].items(), key=lambda kv: -abs(kv[1] - 0.5))[:5]
+    return {"신호등": pc["신호등"], "이유": pc["이유"], "새변수_수": len(pc["추가변수"]),
+            "신호_상위5(AUC)": dict(top)}
+
+
+def _cat_trend(state):
+    from agents.data_agent import periods
+    t = state.truth
+    t = t[t["crym"] <= periods(state.config)["stat_end"]]
+    g = t.groupby(["cat_l", "crym"])["am"].sum().unstack("crym").pct_change(axis=1) * 100
+    return {c: {str(m): round(v, 1) for m, v in row.items() if v == v} for c, row in g.iterrows()}
+
+
+# ---------------------------------------------------------------- 메뉴 항목 설명 (LLM·사람이 읽는 용도)
+DESC = {
+    "객단가": "결제 1건당 평균 금액(금액÷건수). 같은 지출이라도 건수와 단가 중 무엇이 변했는지 구분",
+    "업종비중": "그 고객층의 전체 지출 중 이 업종이 차지하는 비율",
+    "달력변수": "다음 달의 영업일 수·명절 포함 여부·소비쿠폰 기간 여부 (미리 알 수 있는 일정)",
+    "중분류_요약": "업종 안 중분류들의 쏠림 정도(집중도), 1위 중분류 비중, 지난달보다 늘어난 중분류의 비율",
+    "중분류_분해": "업종 안 금액 상위 몇 개 중분류 각각의 비중과 전월 대비 변화",
+    "소분류_요약": "중분류_요약과 같은 지표를 더 잘게 나눈 소분류 기준으로",
+    "원본행수": "원본 거래 조합의 수 (지출이 얼마나 여러 곳에 퍼져 있는지)",
+    "지역_요약": "다른 시도에서 결제한 비중, 가맹점·고객 지역의 쏠림 정도",
+    "지역_분해": "전체 금액 상위 몇 개 지역(코드) 각각의 비중과 전월 대비 변화",
+    "지역_단위": "지역을 시도 단위로 볼지, 수도권만 시군구로 더 잘게 볼지",
+    "미세변동_제외": "다음 달 변화가 ±2% 이내인 애매한 사례를 학습에서만 뺌 (채점은 전부)",
+    "극단값_상한": "학습 데이터의 상·하위 1% 극단값을 잘라 냄",
+    "고객층_표현": "성별·연령구간을 따로 표시할지, 고객층 6개 중 하나로 합쳐 표시할지",
+    "금액_로그변환": "금액 크기 차이를 log로 줄임",
+}
+
+
+def change_desc(c: dict) -> str:
+    """수정안 하나에 대한 쉬운 설명."""
+    if c["종류"] == "묶음":
+        b = c["묶음"]
+        how = "그 거래를 빼고 변수를 계산" if b["처리"] == "제외" else "빼고 계산한 뒤 묶음 금액·전월대비를 별도 변수로 추가"
+        names = ", ".join(s.split(" > ")[-1] for s in b["소분류"][:4]) + (" 등" if len(b["소분류"]) > 4 else "")
+        return f"소분류 {len(b['소분류'])}개({names})를 {b['처리']}: {how}. 근거: {b.get('이유', '')}"
+    return DESC.get(c["항목"], "")
 
 
 # ---------------------------------------------------------------- 레시피 도구

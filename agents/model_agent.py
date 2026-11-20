@@ -225,7 +225,10 @@ def evaluate(state, ds: dict, recipe: dict) -> dict:
         method = "grid"
     t0 = time.time()
     if method == "grid":
-        tasks = [(m, p) for m in used for p in _grid(cfg["후보모델"][m]["좁은범위"])]
+        if state.search_plan:      # 모델 담당이 세운 탐색 계획 (모든 레시피에 같은 계획)
+            tasks = [(m, p) for m, grid in state.search_plan.items() for p in grid]
+        else:
+            tasks = [(m, p) for m in used for p in _grid(cfg["후보모델"][m]["좁은범위"])]
         probs = Parallel(n_jobs=cfg["탐색"]["병렬_작업수"])(
             delayed(_eval_candidate)(cfg, m, p, recipe, X, y, fl, seed, skip) for m, p in tasks)
     else:
@@ -289,6 +292,110 @@ def evaluate(state, ds: dict, recipe: dict) -> dict:
         f"{chosen['모델']} 검증 F1 {chosen['검증F1']:.3f} (기준모델 {best[base_name]['검증F1']:.3f}, "
         f"규칙 {max(rule_f1.values()):.3f})")
     return result
+
+
+# ---------------------------------------------------------------- 모델 담당의 생각 (LLM): 탐색 계획
+MAX_PER_MODEL, MAX_TOTAL = 12, 100
+
+
+def _space_info(cfg, used) -> list[dict]:
+    out = []
+    for m in used:
+        v = cfg["후보모델"][m]
+        out.append({"모델": m, "설명": v.get("설명", ""), "표준화": v.get("표준화_필요"),
+                    "고정설정": v.get("고정설정") or {}, "기본_탐색값": v.get("좁은범위") or {},
+                    "허용_범위(최소,최대)": v.get("넓은범위") or {}})
+    return out
+
+
+def _plan_from(cfg, used, ans) -> tuple[dict | None, str]:
+    """LLM 답 → 탐색 계획 {모델: [설정, ...]}. 허용 범위 밖·조합 과다면 무효."""
+    if not isinstance(ans, dict) or not isinstance(ans.get("모델"), list):
+        return None, "모델 목록 없음"
+    models = [m for m in ans["모델"] if m in used]
+    if cfg["기준모델"] not in models:
+        return None, f"기준모델({cfg['기준모델']})이 빠짐"
+    ranges = ans.get("범위") or {}
+    plan, total = {}, 0
+    for m in models:
+        narrow, wide = cfg["후보모델"][m].get("좁은범위") or {}, cfg["후보모델"][m].get("넓은범위") or {}
+        space = dict(narrow)
+        for k, vals in (ranges.get(m) or {}).items():
+            if k not in narrow and k not in wide:
+                return None, f"{m}의 '{k}'는 탐색할 수 없는 설정"
+            if not isinstance(vals, list) or not vals:
+                return None, f"{m}의 '{k}' 값 목록이 비었음"
+            fixed = []
+            for v in vals:
+                lo_hi = wide.get(k)
+                if isinstance(v, (int, float)) and not isinstance(v, bool) and isinstance(lo_hi, list) and len(lo_hi) == 2 \
+                        and all(isinstance(x, (int, float)) for x in lo_hi):
+                    if not (lo_hi[0] <= v <= lo_hi[1]):
+                        return None, f"{m}의 {k}={v}가 허용 범위 {lo_hi} 밖"
+                    fixed.append(int(v) if all(isinstance(x, int) for x in lo_hi) else float(v))
+                elif v in (narrow.get(k) or []):
+                    fixed.append(v)
+                else:
+                    return None, f"{m}의 {k}={v}는 허용되지 않는 값"
+            uniq = list(dict.fromkeys(fixed))
+            space[k] = sorted(uniq) if all(isinstance(x, (int, float)) for x in uniq) else uniq
+        grid = _grid(space)
+        if len(grid) > MAX_PER_MODEL:
+            return None, f"{m}의 조합이 {len(grid)}개로 {MAX_PER_MODEL}개 초과"
+        plan[m], total = grid, total + len(grid)
+    if total > MAX_TOTAL:
+        return None, f"전체 조합 {total}개로 {MAX_TOTAL}개 초과"
+    return plan, ""
+
+
+def plan(state, ds: dict, recipe: dict) -> dict:
+    """모델 담당: ① 탐색 계획 → 탐색 실행 → ② 1차 결과를 보고 범위 조정 → 최종 계획을 모든 레시피에 사용."""
+    import llm
+    from agents.reviewer import adoption_rule_text
+    cfg = state.config
+    used = [m for m, v in cfg["후보모델"].items() if is_on(v.get("사용")) and not optional_missing(m)]
+    meta = ds["dev"]["meta"]
+    groups = pd.Series(ds["groups"]).value_counts().to_dict()
+    summary = {"학습_문제": {"3~5월": int((meta["crym"] < periods(cfg)["valid"][0]).sum()), "3~7월(최대)": int((meta["crym"] < periods(cfg)["dev_end"]).sum())},
+               "검증_문제": int(meta["crym"].isin(periods(cfg)["valid"]).sum()), "증가_비율": round(float(meta["label"].mean()), 3),
+               "변수_수": len(ds["cols"]), "변수_묶음별_개수": groups}
+    rule = adoption_rule_text(cfg)
+    default_plan = {m: _grid(cfg["후보모델"][m]["좁은범위"]) for m in used}
+
+    def check(ans):
+        p, why = _plan_from(cfg, used, ans)
+        return p is not None, why
+
+    data = {"데이터_요약": summary, "후보_모델": _space_info(cfg, used), "기준모델": cfg["기준모델"],
+            "제한": f"모델당 조합 {MAX_PER_MODEL}개 이하, 전체 {MAX_TOTAL}개 이하. '범위'에 안 적은 모델은 기본_탐색값을 그대로 씀",
+            "채택_규칙": rule + " 모델도 이 규칙으로 기준모델을 이겨야만 선택된다."}
+    tools = {"변수_목록": {"인자": "", "설명": "지금 레시피의 변수 이름과 묶음",
+                         "함수": lambda a: {c: ds["groups"][c] for c in ds["cols"]}}}
+    ans, who = llm.ask(state, "모델 탐색 계획", "model_plan.md", data, {"모델": used, "범위": {}, "이유": "모든 후보 모델의 기본 탐색값 (규칙)"},
+                       check, tools)
+    state.search_plan = _plan_from(cfg, used, ans)[0] or default_plan
+    n = sum(len(g) for g in state.search_plan.values())
+    state.decide("③ 모델", "탐색 계획 (1차)", f"후보 모델 {len(used)}종", f"{len(state.search_plan)}종 · 조합 {n}개", who, ans.get("이유", ""))
+    state.log(f"[3] 모델 담당 탐색 계획: {len(state.search_plan)}종 · 조합 {n}개 ({who})")
+    res = evaluate(state, ds, recipe)
+
+    if who.startswith("LLM"):       # 1차 결과를 보고 범위 조정 (1회)
+        data2 = {**data, "지금_계획": {m: (ans.get("범위") or {}).get(m, "기본_탐색값") for m in state.search_plan},
+                 "1차_결과_모델별_1등": res["모델별"].to_dict("records"), "선택된_모델": f"{res['모델']} {res['설정']}",
+                 "규칙_검증F1": res["규칙F1"]}
+        ans2, who2 = llm.ask(state, "모델 탐색 조정", "model_refine.md", data2, {"유지": True, "이유": "조정 없음"},
+                             lambda a: (True, "") if isinstance(a, dict) and a.get("유지") is True else check(a))
+        if not ans2.get("유지"):
+            new = _plan_from(cfg, used, ans2)[0]
+            if new and new != state.search_plan:
+                state.search_plan = new
+                n = sum(len(g) for g in new.values())
+                state.decide("③ 모델", "탐색 계획 조정 (2차)", "1차 결과", f"{len(new)}종 · 조합 {n}개", who2, ans2.get("이유", ""))
+                state.log(f"[3] 모델 담당 범위 조정: {len(new)}종 · 조합 {n}개 → 레시피 {recipe['이름']} 다시 검증")
+                res = evaluate(state, ds, recipe)
+        else:
+            state.decide("③ 모델", "탐색 계획 조정 (2차)", "1차 결과", "유지", who2, ans2.get("이유", ""))
+    return res
 
 
 # ---------------------------------------------------------------- Optuna (선택)

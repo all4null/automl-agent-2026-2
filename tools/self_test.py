@@ -39,10 +39,10 @@ def main():
     check("1. 원본 행을 지우지 않음", q["검산"]["통과"] and q["검산"]["원본_행수"] == q["행수"]["원본"],
           f"(원본 {q['검산']['원본_행수']:,}행 = 정제 {q['행수']['원본']:,}행, 중복 초과 {q.get('중복', {}).get('완전중복_초과행수', '?')}행 유지)")
 
+    data_agent.build_truth(s)        # run.py와 같은 순서: 정답표 → 계획
     planner.run(s)
-    data_agent.build_truth(s)
     A = s.recipes["A"]
-    dA = data_agent.build(s, A)
+    dA = s.datasets["A"]
     st = data_agent.subcat_stats(s)
     cat = s.quality["업종"]["대분류"][-1]
     whole = [x for x in st["소분류"] if x.startswith(cat + " > ")]

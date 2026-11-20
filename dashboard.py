@@ -98,6 +98,14 @@ def build(state, insights: dict):
                      "낮습니다. 수정 단계에서 검증 데이터에 과적합됐을 수 있습니다.</div>")
     S.append(f"<div class='card'><b>최종 레시피 {state.current}</b>: {html.escape(describe(state.recipes[state.current]))}<br>"
              f"<b>모델</b>: {html.escape(final['모델'])} {html.escape(str(final['설정']))}</div>")
+    ex = state.explanation
+    if ex:
+        lists = "".join(f"<h3>{html.escape(t)}</h3><ul>" + "".join(f"<li>{html.escape(str(x))}</li>" for x in ex.get(k) or []) + "</ul>"
+                        for k, t in [("결정_해석", "에이전트 결정 해석"), ("업종_인사이트", "업종 인사이트"), ("다음에_해볼_것", "다음에 해볼 것")]
+                        if ex.get(k))
+        S.append(f"<div class='card'><b>LLM이 쓴 해석</b> <span class='pill'>{html.escape(ex['결정자'])} · {html.escape(ex['모델'])}</span> "
+                 f"<span class='sub'>검증되지 않은 해석입니다. 테스트 점수는 보지 않고 썼습니다.</span>"
+                 f"<p>{html.escape(ex['요약'])}</p>{lists}</div>")
 
     # 2. 원본 점검
     S.append('<h2 id="s2">2. 원본 점검</h2>')
@@ -107,6 +115,12 @@ def build(state, insights: dict):
                          "고객·가맹점 지역 수": f"{q['지역']['고객지역_수']} / {q['지역']['가맹점지역_수']} (코드로만 표시)",
                          "금액이 같아 빠진 '유지' 문제": q.get("유지_건수"), "월별 급변(±30%)": q["월별"]["급변월"] or "없음"})))
     S.append("<h3>점검 항목</h3>" + _table(_kv(q["점검"])))
+    dr = state.data_review
+    if dr:
+        S.append(f"<div class='card'><b>원본 담당의 판단</b> <span class='pill'>{html.escape(dr['결정자'])}</span><ul>"
+                 + "".join(f"<li>{html.escape(str(x))}</li>" for x in dr.get("데이터_주의점") or ["(주의점 없음)"]) + "</ul>"
+                 + f"<p class='sub'>소분류 묶음 후보 제안: 비소비성 {len(dr.get('비소비성_후보', []))}개, "
+                   f"본사집계의심 {len(dr.get('본사집계의심_후보', []))}개. {html.escape(dr.get('이유', ''))}</p></div>")
     if "중복" in q:
         d = q["중복"]
         S.append(f"<h3>적재 중복 진단</h3><p>12칼럼이 모두 같은 행: {d['완전중복_묶음수']:,}묶음, 초과 {d['완전중복_초과행수']:,}행. "
@@ -146,6 +160,11 @@ def build(state, insights: dict):
     S.append(_table(final["모델별"]))
     if t:
         S.append("<h3>테스트 (1회)</h3>" + _table(pd.DataFrame(t["표"])))
+        ti = state.test_interpretation
+        if ti:
+            S.append(f"<div class='card'><b>실행 담당의 테스트 해석</b> <span class='pill'>{html.escape(ti['결정자'])} · {html.escape(ti['모델'])}</span>"
+                     f"<p>{html.escape(ti['해석'])}</p><ul>" + "".join(f"<li>{html.escape(str(x))}</li>" for x in ti.get("주의점") or [])
+                     + "</ul><p class='sub'>모든 선택이 끝난 뒤 작성된 해석이며, 결과를 바꾸지 않습니다.</p></div>")
         cm = t["혼동행렬"]
         S.append('<div class="grid2">' + _confusion(cm) + _monthly_fig(state) + "</div>")
         S.append("<h3>클래스별</h3>" + _table(pd.DataFrame(t["클래스별"]).T.reset_index().rename(columns={"index": "클래스"})))
@@ -176,22 +195,33 @@ def build(state, insights: dict):
     # 8. Mini Agent
     S.append('<h2 id="s8">8. Mini AutoML-Agent 구성</h2>')
     S.append(_table(pd.DataFrame([
-        ["[0] raw_agent", "원본 CSV 점검·정제 → 정제 원본 parquet (원본을 읽는 유일한 곳)", "규칙"],
-        ["[1] planner", "설정 검사, 처음 레시피 A·B", "규칙 또는 LLM"],
-        ["[2] data_agent", "정답표(고정) + 레시피 변수표, 사전 점검(🟢🟡🔴)", "규칙"],
-        ["[3] model_agent", "후보 × 롤링 검증 3회차 → 채택 규칙으로 모델 선택", "탐색(grid/optuna)"],
-        ["[5] reviewer.check", "수정안 고르기 → 사전 점검 → 검증 → 채택/기각", "규칙 또는 LLM"],
-        ["[4] executor", "테스트 1회, 월별 갱신 실험, 예측표", "규칙"],
-        ["[5] reviewer.report", "결과 파일·이 보고서", "규칙"]], columns=["역할", "하는 일", "결정 방식"])))
+        ["[0] 원본 (raw_agent)", "원본 CSV 점검·정제 (코드)", "품질 점검 해석, 소분류 묶음 후보 제안", "원본 행은 안 봄, 중복 삭제 금지"],
+        ["[1] 계획 (planner)", "처음 레시피 A", "레시피 B에 켤 변수 (도구: 변수 신호 미리보기)", "메뉴 밖 불가, 검토 담당이 검토"],
+        ["[2] 데이터 (data_agent)", "정답표(고정)·변수표·사전 점검 (코드)", "분해 변수 개수, 🟢 수정안을 진행할지", "🟡🔴 못 뒤집음, 정답 고정"],
+        ["[3] 모델 (model_agent)", "후보 학습·롤링 검증 (탐색 도구)", "탐색할 모델 계열·범위, 1차 결과 보고 범위 조정", "숫자는 탐색이 찾음, 허용 범위 안, 채택 규칙"],
+        ["[4] 실행 (executor)", "테스트 1회·월별 갱신·예측표 (코드)", "테스트 전 실험 계획, 테스트 후 해석", "테스트 본 뒤 다시 고르기 금지"],
+        ["[5] 검토 (reviewer)", "채택 규칙 판정·보고서 (코드)", "계획 검토, 다음 수정안·묶음, 결과 해석", "채택은 규칙이 판정"]],
+        columns=["에이전트", "코드가 하는 일", "LLM이 생각하는 일", "넘을 수 없는 선"])))
     pdir = Path(__file__).resolve().parent / "prompts"
-    for f in ["system.md", "planner.md", "reviewer.md"]:
-        S.append(f"<details><summary>프롬프트: {f}</summary><pre>{html.escape((pdir / f).read_text(encoding='utf-8'))}</pre></details>")
+    for f in sorted(pdir.glob("*.md")):
+        S.append(f"<details><summary>프롬프트: {f.name}</summary><pre style='white-space:pre-wrap'>{html.escape(f.read_text(encoding='utf-8'))}</pre></details>")
 
     # 9. AI 활용 내역
     S.append('<h2 id="s9">9. AI 활용 내역</h2>')
     if state.llm_calls:
-        S.append(_table(pd.DataFrame([{"시각": c["시각"], "목적": c["목적"], "모드": c["모드"], "채택": c.get("채택"),
-                                       "답": str(c.get("답"))[:300], "비고": c.get("비고", "")} for c in state.llm_calls])))
+        S.append(_table(pd.DataFrame([{"번호": c["번호"], "시각": c["시각"], "에이전트": c.get("에이전트"), "목적": c["목적"],
+                                       "모드": c["모드"], "모델": c.get("모델"), "도구": len(c.get("도구사용", [])),
+                                       "채택": c.get("채택"), "답": str(c.get("답"))[:300], "비고": c.get("비고", ""),
+                                       "기록 파일": c.get("파일", "")} for c in state.llm_calls])))
+        title = {"system": "시스템 프롬프트", "user": "사용자 (지시문 + 자료)", "assistant": "LLM 응답"}
+        for c in state.llm_calls:
+            turns = []
+            for i, msg in enumerate(c.get("대화", [])):
+                head = "도구 결과 / 추가 지시" if (msg["role"] == "user" and i > 1) else title.get(msg["role"], msg["role"])
+                turns.append(f"<h3>{i}. {head}</h3><pre style='white-space:pre-wrap'>{html.escape(str(msg['content']))}</pre>")
+            S.append(f"<details class='card'><summary>LLM 호출 {c['번호']} · {html.escape(c.get('에이전트', ''))} 담당 · "
+                     f"{html.escape(c['목적'])} · 도구 {len(c.get('도구사용', []))}회 — {'채택' if c.get('채택') else '무효'}</summary>"
+                     + "".join(turns) + "</details>")
     else:
         S.append("<p>이번 실행은 LLM 없이 규칙 모드로 판단했습니다. 결정 기록의 '결정자' 칸에서 규칙·탐색·LLM을 구분할 수 있습니다.</p>")
 

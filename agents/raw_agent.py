@@ -94,6 +94,53 @@ def run(state, raw_override: str | None = None):
     return state
 
 
+# ---------------------------------------------------------------- 원본 담당의 생각 (LLM)
+def review(state):
+    """품질 점검표·업종 목록(집계값)을 읽고 데이터 주의점과 소분류 묶음 후보를 제안한다. 원본 행은 보지 않는다."""
+    import llm
+    from agents import data_agent
+    q = state.quality
+    st = data_agent.subcat_stats(state)
+    have = set(st["소분류"])
+    hints = {k: [s for s in v if s in have] for k, v in (state.config["소분류처리"].get("힌트") or {}).items()}
+    data = {"원본_요약": {k: q.get(k) for k in ["행수", "제외내역", "점검", "월별", "업종", "지역", "유지_건수"]},
+            "중복_진단_요약": q.get("중복"),
+            "설정의_힌트_목록": hints,
+            "소분류_목록_금액상위30": st.sort_values("금액비중", ascending=False).head(30).to_dict("records"),
+            "소분류_통계_설명": "1~5월 기준. 금액비중=전체 지출 중 비율, 월변동계수=월별 금액의 흔들림, "
+                                "대분류변화기여도=같은 대분류 안 월 변화량 중 이 소분류 몫, 가맹점1위시도비중=한 시도에 몰린 정도"}
+    tools = {
+        "소분류_목록": {"인자": "대분류", "설명": "그 대분류에 속한 모든 소분류와 통계 (1~5월)",
+                       "함수": lambda a: st[st["소분류"].str.startswith(str(a.get("대분류", "")) + " > ")].to_dict("records")},
+        "소분류_월별": {"인자": "소분류 ('대 > 중 > 소')", "설명": "그 소분류의 1~5월 월별 금액과 대분류 안 비중",
+                       "함수": lambda a: data_agent.sub_monthly(state, str(a.get("소분류", "")))},
+    }
+
+    def ok(ans):
+        if not isinstance(ans, dict):
+            return False, "형식 오류"
+        for k in ["비소비성_후보", "본사집계의심_후보"]:
+            v = ans.get(k, [])
+            if not isinstance(v, list):
+                return False, f"{k}가 목록이 아님"
+            ans[k] = [s for s in v if s in have][:20]
+        if not isinstance(ans.get("데이터_주의점", []), list):
+            return False, "데이터_주의점이 목록이 아님"
+        return True, ""
+
+    default = {"데이터_주의점": [], "비소비성_후보": [], "본사집계의심_후보": [], "이유": "규칙 모드: 설정의 힌트 목록만 사용"}
+    ans, who = llm.ask(state, "원본 해석", "raw.md", data, default, ok, tools)
+    state.data_review = {**ans, "결정자": who}
+    state.hints = dict(hints)
+    for key, name in [("비소비성_후보", "LLM_비소비성"), ("본사집계의심_후보", "LLM_본사집계의심")]:
+        if ans.get(key):
+            state.hints[name] = ans[key]
+    state.decide("⓪ 원본", "데이터 주의점·소분류 후보", f"소분류 {len(have)}개",
+                 f"비소비성 {len(ans.get('비소비성_후보', []))}개, 본사집계의심 {len(ans.get('본사집계의심_후보', []))}개 제안",
+                 who, ans.get("이유", ""))
+    return state
+
+
 # ---------------------------------------------------------------- 파일 판별
 def _resolve_raw(cfg, override):
     if override:

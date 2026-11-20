@@ -45,6 +45,7 @@ def run(state):
     seed, P = cfg["난수시드"], periods(cfg)
     n_boot = cfg["평가"]["부트스트랩_횟수"]
     final, first = state.current, state.first_recipe
+    state.exec_plan = _plan_monthly(state)          # 실행 담당: 테스트를 열기 전에 월별 갱신 실험 계획을 정함
     log(f"[4] 테스트 개봉: 최종 레시피 {final}" + (f", 비교용 처음 레시피 {first}" if first != final else ""))
 
     scored, models = {}, {}
@@ -110,6 +111,7 @@ def run(state):
         f"규칙 {max(r['macro_f1'] for r in rule_rows):.3f}, 두 규칙을 이긴 달 {win_months}/{len(P['test'])} → "
         f"{'성공' if win_months >= 2 else '실패'}" + (", 처음 레시피보다 낮음: 검증 과적합 의심" if state.test["과적합경고"] else ""))
     _monthly(state)
+    state.test_interpretation = _interpret(state)   # 실행 담당: 테스트 해석 (다시 고르는 데 쓰지 않음)
     return state
 
 
@@ -198,7 +200,8 @@ def _monthly(state):
 
     # 확장 재학습: 매달 누적 기간으로 처음부터 다시 학습
     bbm = res["best_by_model"]
-    names = [res["모델"]] + [m for m in cfg["월별갱신"]["확장재학습_모델"] if m in bbm and m != res["모델"]]
+    plan = state.exec_plan or {"확장재학습_모델": cfg["월별갱신"]["확장재학습_모델"], "순차갱신": True}
+    names = [res["모델"]] + [m for m in plan["확장재학습_모델"] if m in bbm and m != res["모델"]]
     for name in names:
         for m in P["test"]:
             tr = _train_rows(meta, recipe, crym < m)
@@ -211,7 +214,7 @@ def _monthly(state):
                          "macro_f1": round(macro_f1(y[k], _proba(pipes, X[k]) >= 0.5), 4)})
 
     # 순차 갱신: SGD가 새 달 데이터만으로 조금씩 고침. 갱신 전 점수 기록 + 지식 손실 점검
-    if "SGD" in bbm:
+    if "SGD" in bbm and plan.get("순차갱신", True):
         th = cfg["월별갱신"]["지식손실_기준"]
         tr0 = _train_rows(meta, recipe, dev)
         pipe = make_pipeline(cfg, "SGD", bbm["SGD"]["설정"], recipe, seed, onehot_idx(ds)).fit(X[tr0], y[tr0])
@@ -259,3 +262,78 @@ def _monthly(state):
 def _clf_pred(pre, clf, X):
     p = clf.predict_proba(pre.transform(X))[:, list(clf.classes_).index(1)]
     return (p >= 0.5).astype(int)
+
+
+# ---------------------------------------------------------------- 실행 담당의 생각 (LLM)
+def _plan_monthly(state) -> dict:
+    """테스트를 열기 전에, 월별 갱신 실험에서 어떤 모델을 비교할지 정한다 (검증 결과만 봄)."""
+    import llm
+    cfg = state.config
+    res = state.results[state.current]
+    bbm = res["best_by_model"]
+    data = {"최종_레시피": state.current, "최종_모델": f"{res['모델']} {res['설정']}",
+            "모델별_검증F1": {m: v["검증F1"] for m, v in bbm.items()},
+            "실험_설명": "테스트 3개월 동안 매달 '예측 → 점수 기록 → 정답 공개 → 갱신'. "
+                         "확장재학습 = 누적 데이터로 매달 처음부터 다시 학습, 순차갱신 = SGD가 새 달 데이터만 추가 학습",
+            "설정_기본값": {"확장재학습_모델": cfg["월별갱신"]["확장재학습_모델"], "순차갱신": "SGD" in bbm},
+            "제한": "확장재학습_모델은 모델별_검증F1에 있는 모델 중 최대 4개 (최종 모델은 항상 포함)"}
+
+    def ok(a):
+        good = (isinstance(a, dict) and isinstance(a.get("확장재학습_모델"), list) and len(a["확장재학습_모델"]) <= 4
+                and all(m in bbm for m in a["확장재학습_모델"]) and isinstance(a.get("순차갱신"), bool))
+        return good, "" if good else "모델 이름이 목록 밖이거나 형식 오류"
+
+    default = {"확장재학습_모델": [m for m in cfg["월별갱신"]["확장재학습_모델"] if m in bbm], "순차갱신": "SGD" in bbm,
+               "이유": "설정 기본값 (규칙)"}
+    ans, who = llm.ask(state, "실행 계획", "exec_plan.md", data, default, ok)
+    state.decide("④ 실행", "월별 갱신 실험 계획 (테스트 전)", ", ".join(bbm),
+                 f"확장재학습 {ans['확장재학습_모델']}, 순차갱신 {'O' if ans['순차갱신'] else 'X'}", who, ans.get("이유", ""))
+    return ans
+
+
+def _interpret(state) -> dict | None:
+    """테스트를 연 뒤 결과를 해석한다. 모든 선택이 끝난 뒤라 테스트 점수를 봐도 결과에 영향이 없다."""
+    import llm
+    t, res = state.test, state.results[state.current]
+    months = [k for k in t["표"][0] if k.endswith("월") and k[:-1].isdigit()]
+    final_row = t["표"][0]
+    rules = [r for r in t["표"] if r["모델"].startswith("규칙")]
+    # 월별 비교는 코드가 계산해서 준다 (LLM이 표를 잘못 읽지 않게)
+    compare = {m: {"최종": final_row[m], **{r["모델"]: r[m] for r in rules},
+                   "두_규칙_모두_이김": all(final_row[m] > r[m] for r in rules)} for m in months}
+    wins = {r["모델"]: sum(final_row[m] > r[m] for m in months) for r in rules}
+    tf, vf = t["최종"]["macro_f1"], t["최종"]["검증F1"]
+    mon = pd.DataFrame(state.monthly["표"]).groupby(["방식", "모델"])["macro_f1"].mean().round(3)
+    fixed = mon.xs("고정", level="방식").iloc[0] if "고정" in mon.index.get_level_values(0) else None
+    worst_cat = min(t["오류분석"]["업종별"].items(), key=lambda kv: kv[1])
+    cm = t["혼동행렬"]
+    facts = [  # 해석이 이 사실과 모순되지 않게, 코드가 문장으로 만들어 준다
+        f"최종 모델은 규칙1(다수방향)을 {wins.get('규칙1 다수방향', 0)}/{len(months)}개월, 규칙2(직전방향유지)를 "
+        f"{wins.get('규칙2 직전방향유지', 0)}/{len(months)}개월 이겼다. 두 규칙을 모두 이긴 달은 {t['성공월수']}개월이고, "
+        f"성공 판정은 '{'성공' if t['성공'] else '실패'}'이다.",
+        f"테스트 Macro-F1은 {tf:.3f} (95% 구간 {final_row['95%구간_하']:.3f}~{final_row['95%구간_상']:.3f}), 검증 Macro-F1은 {vf:.3f}이다. "
+        f"테스트가 검증보다 {abs(tf - vf):.3f} {'높다' if tf > vf else '낮다' if tf < vf else '같다'}.",
+        (f"처음 레시피({t['처음']['레시피']})의 테스트 점수는 {t['처음']['macro_f1']:.3f}로 최종과 같은 레시피다."
+         if t["처음"]["레시피"] == t["최종"]["레시피"] else
+         f"처음 레시피({t['처음']['레시피']}) 테스트 {t['처음']['macro_f1']:.3f}, 최종 레시피({t['최종']['레시피']}) 테스트 {tf:.3f}. "
+         f"과적합 경고는 '{'있음' if t['과적합경고'] else '없음'}'."),
+        f"혼동행렬: 실제 증가인데 감소로 예측 {cm['실제증가_예측감소']}건, 실제 감소인데 증가로 예측 {cm['실제감소_예측증가']}건.",
+        "월별 갱신(테스트 3개월 평균 F1): " + ", ".join(f"{a}/{b} {v:.3f}" for (a, b), v in mon.items())
+        + (f" (고정 모델 {fixed:.3f}과 비교)" if fixed is not None else ""),
+        f"업종별 정답률이 가장 낮은 곳은 {worst_cat[0]} ({worst_cat[1]:.3f})이다 (셀이 작아 참고용).",
+    ]
+    data = {"확인된_사실(코드가_계산)": facts, "월별_규칙_비교(코드가_계산)": compare, "규칙별_이긴_달수(코드가_계산)": wins,
+            "테스트_표": t["표"], "최종": t["최종"], "처음": t["처음"], "성공판정": t["성공"], "성공월수": t["성공월수"],
+            "과적합경고": t["과적합경고"], "혼동행렬": t["혼동행렬"], "클래스별": t["클래스별"],
+            "검증_월별F1": res["월별F1"], "월별갱신": state.monthly["표"], "지식손실": state.monthly["지식손실"],
+            "분포변화": state.monthly["분포변화"], "업종별_정답률": t["오류분석"]["업종별"], "고객층별_정답률": t["오류분석"]["고객층별"]}
+
+    def ok(a):
+        good = isinstance(a, dict) and isinstance(a.get("해석"), str) and a["해석"].strip()
+        return bool(good), "" if good else "해석 없음"
+
+    ans, who = llm.ask(state, "테스트 해석", "test_interpret.md", data, None, ok)
+    if not ans:
+        return None
+    state.decide("④ 실행", "테스트 해석 (테스트 후, 선택에 쓰지 않음)", "-", "보고서에 기록", who, ans["해석"][:200])
+    return {**ans, "결정자": who, "모델": llm.model_name(state, "실행")}

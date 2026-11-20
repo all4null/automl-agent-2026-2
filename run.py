@@ -28,10 +28,17 @@ def main():
     ap.add_argument("--check", action="store_true", help="설정 요약과 오류만 확인")
     ap.add_argument("--raw", help="원본 CSV 경로 (config 대신)")
     ap.add_argument("--replay", help="이전 실행 폴더 (그 실행의 LLM 답을 재사용)")
+    ap.add_argument("--llm", choices=["규칙", "ollama", "openai"], help="이번 실행만 LLM 모드 바꾸기 (config.yaml은 그대로)")
+    ap.add_argument("--llm-model", help="이번 실행만 LLM 모델 이름 바꾸기 (예: gpt-4.1)")
     a = ap.parse_args()
 
     try:
         cfg = load_config(a.config)
+        if a.llm:
+            cfg["LLM"]["모드"] = a.llm
+        if a.llm_model and cfg["LLM"]["모드"] in ("ollama", "openai"):
+            cfg["LLM"][cfg["LLM"]["모드"]]["모델"] = a.llm_model
+            cfg["LLM"]["에이전트별_모델"] = {}          # 모든 에이전트가 이 모델을 씀
         if a.raw and is_fake(a.raw):
             # 가짜데이터 시험은 실데이터 결과·보안 폴더와 섞이지 않게 따로 둔다
             cfg["경로"]["결과폴더"] = cfg["경로"].get("가짜_결과폴더", "../결과/테스트_agent")
@@ -82,15 +89,15 @@ def run_all(state, raw=None):
     from agents import data_agent, executor, model_agent, planner, raw_agent, reviewer
 
     raw_agent.run(state, raw)                         # [0] 원본 점검·정제 (원본을 읽는 유일한 단계)
-    planner.run(state)                                # [1] 설정 검사, 처음 레시피 A·B
+    raw_agent.review(state)                           # [0] 원본 담당 생각: 데이터 주의점, 소분류 묶음 후보 제안
     data_agent.build_truth(state)                     # [2] 정답표 (고정)
-    for name in ["A", "B"]:                           # [2]+[3] 처음 레시피 둘 다 검증
-        state.datasets[name] = data_agent.build(state, state.recipes[name])
-        model_agent.evaluate(state, state.datasets[name], state.recipes[name])
+    planner.run(state)                                # [1] 계획 담당 생각: 레시피 B 제안 → [5] 검토 담당이 계획 검토
+    model_agent.plan(state, state.datasets["A"], state.recipes["A"])   # [3] 모델 담당 생각: 탐색 계획 → A 검증 → 범위 조정
+    model_agent.evaluate(state, state.datasets["B"], state.recipes["B"])  # [3] 같은 계획으로 B 검증
     reviewer.choose_initial(state)                    # [5] B가 채택 규칙을 넘을 때만 B로 시작
-    reviewer.check(state)                             # [5] 수정안 → 사전 점검 → 검증 → 채택/기각
-    executor.run(state)                               # [4] 테스트 단 1회 + 월별 갱신 실험
-    reviewer.report(state)                            # [5] 결과 파일·대시보드
+    reviewer.check(state)                             # [5] 검토 담당 생각: 수정안 → [2] 데이터 담당 판단 → [3] 검증 → 채택 규칙
+    executor.run(state)                               # [4] 실행 담당 생각: 실험 계획 → 테스트 단 1회 → 해석
+    reviewer.report(state)                            # [5] 검토 담당 생각: 결과 해석 → 결과 파일·대시보드
     return state
 
 
@@ -130,6 +137,13 @@ def print_summary(cfg, err, warn, raw=None):
           f"(최대 {s['최대횟수']}회)")
     import llm
     print(f" LLM: {cfg['LLM']['모드']}" + ("" if cfg["LLM"]["모드"] == "규칙" else f" (모델 {cfg['LLM'][cfg['LLM']['모드']]['모델']})"))
+    if cfg["LLM"]["모드"] != "규칙":
+        roles = cfg["LLM"].get("맡길_일") or {}
+        rec = cfg["LLM"].get("기록") or {}
+        if cfg["LLM"]["모드"] == "openai" and cfg["LLM"].get("에이전트별_모델"):
+            print("   에이전트별 모델: " + ", ".join(f"{k} {v}" for k, v in cfg["LLM"]["에이전트별_모델"].items()))
+        print("   맡길 일: " + ", ".join(f"{k} {'O' if is_on(v) else 'X'}" for k, v in roles.items())
+              + " | 기록: " + ", ".join(f"{k} {'O' if is_on(v) else 'X'}" for k, v in rec.items()))
     for w in warn:
         print(f" ⚠ {w}")
     if err:

@@ -367,6 +367,100 @@ def subcat_stats(state) -> pd.DataFrame:
     return state.subcat_stats
 
 
+# ---------------------------------------------------------------- 에이전트 도구 (집계값만 돌려줌, 1~5월만)
+def sub_monthly(state, name: str) -> dict:
+    """소분류 하나의 1~5월 월별 금액과 그 대분류 안 비중."""
+    parts = name.split(" > ")
+    if len(parts) != 3:
+        return {"오류": "소분류는 '대 > 중 > 소' 형식"}
+    P = periods(state.config)
+    con = _con(state)
+    con.register("q", pd.DataFrame([parts], columns=["l", "m", "s"]))
+    d = con.execute(f"""SELECT crym, CAST(sum(am) FILTER (WHERE cat_m = q.m AND cat_s = q.s) AS BIGINT) sub,
+                               CAST(sum(am) AS BIGINT) cat
+                        FROM clean, q WHERE cat_l = q.l AND crym <= {P['stat_end']} GROUP BY crym ORDER BY crym""").df()
+    con.close()
+    return {str(r.crym): {"금액": int(r.sub or 0), "대분류_안_비중": round(float((r.sub or 0) / r.cat), 4) if r.cat else 0}
+            for r in d.itertuples()}
+
+
+def region_shares(state, level: str = "시도", side: str = "가맹점") -> list:
+    """1~5월 지역(코드)별 금액 비중과 월평균 건수 상위 15개."""
+    P = periods(state.config)
+    col = ("merch" if side == "가맹점" else "cust") + ("_sido" if level == "시도" else "_reg")
+    con = _con(state)
+    d = con.execute(f"""SELECT {col} code, sum(am) am, sum(ct) / count(DISTINCT crym) ct FROM clean
+                        WHERE crym <= {P['stat_end']} GROUP BY 1 ORDER BY am DESC""").df()
+    con.close()
+    d["비중"] = (d["am"] / d["am"].sum()).round(4)
+    return [{"코드": r.code, "금액비중": r.비중, "월평균건수": int(r.ct)} for r in d.head(15).itertuples()]
+
+
+def mid_shares(state) -> dict:
+    """1~5월 대분류별 중분류 금액 비중."""
+    P = periods(state.config)
+    con = _con(state)
+    d = con.execute(f"SELECT cat_l, cat_m, sum(am) am FROM clean WHERE crym <= {P['stat_end']} GROUP BY ALL").df()
+    con.close()
+    d["비중"] = d["am"] / d.groupby("cat_l")["am"].transform("sum")
+    return {l: {r.cat_m: round(float(r.비중), 3) for r in g.sort_values("비중", ascending=False).itertuples()}
+            for l, g in d.groupby("cat_l")}
+
+
+# ---------------------------------------------------------------- 데이터 담당의 생각 (LLM)
+def decide_details(state, recipe: dict, change: dict) -> dict:
+    """분해 변수를 켤 때, 상위 몇 개 지역·중분류를 따로 볼지 정한다 (설정값 범위 안)."""
+    import llm
+    o = recipe["원본변수"]
+    if not (o.get("지역_분해") or o.get("중분류_분해")) or change.get("종류") not in ("원본변수", "지역_단위"):
+        return recipe
+    data = {"수정안": change.get("항목"), "지역_단위": recipe["지역_단위"],
+            "지금_설정": {"상위지역_수": recipe["상위지역_수"], "상위중분류_수": recipe["상위중분류_수"]},
+            "허용_범위": {"상위지역_수": [1, 8], "상위중분류_수": [1, 5]},
+            "최소_월평균건수": state.config["원본변수"]["최소_월평균건수"],
+            "참고": "분해 변수는 개수마다 비중·전월대비 2개씩 늘어남. 학습 문제가 144~240개라 너무 많으면 과적합"}
+    tools = {
+        "지역별_금액비중": {"인자": "단위(시도|세부), 쪽(가맹점|고객)", "설명": "1~5월 지역 코드별 금액 비중·월평균 건수 상위 15",
+                          "함수": lambda a: region_shares(state, a.get("단위", recipe["지역_단위"]), a.get("쪽", "가맹점"))},
+        "중분류_금액비중": {"인자": "", "설명": "1~5월 대분류별 중분류 금액 비중", "함수": lambda a: mid_shares(state)},
+    }
+
+    def ok(ans):
+        try:
+            r, m = int(ans.get("상위지역_수")), int(ans.get("상위중분류_수"))
+        except (TypeError, ValueError, AttributeError):
+            return False, "숫자가 아님"
+        good = 1 <= r <= 8 and 1 <= m <= 5
+        return good, "" if good else "허용 범위 밖"
+
+    default = {"상위지역_수": recipe["상위지역_수"], "상위중분류_수": recipe["상위중분류_수"], "이유": "설정값 그대로 (규칙)"}
+    ans, who = llm.ask(state, "변수 세부 설정", "data_details.md", data, default, ok, tools)
+    recipe["상위지역_수"], recipe["상위중분류_수"] = int(ans["상위지역_수"]), int(ans["상위중분류_수"])
+    state.decide("② 데이터", f"분해 변수 개수 ({recipe['이름']})", "지역 1~8 / 중분류 1~5",
+                 f"지역 {recipe['상위지역_수']} / 중분류 {recipe['상위중분류_수']}", who, ans.get("이유", ""))
+    return recipe
+
+
+def judge_precheck(state, pc: dict, change_label: str, remaining: int) -> dict:
+    """사전 점검을 통과(🟢)한 수정안을 실제로 검증까지 진행할지 판단한다. 🟡·🔴는 뒤집지 못한다."""
+    import llm
+    if pc["신호등"] != "🟢":
+        return pc
+    data = {"수정안": change_label, "사전점검": {k: pc[k] for k in ["신호등", "이유", "추가변수", "제거변수", "바뀐변수", "바뀐값비율", "신호"]},
+            "남은_검증_시도": remaining,
+            "참고": "진행하면 검증 시도 1회를 쓴다. 신호가 약하거나 기존 변수와 같은 정보로 보이면 아끼는 편이 낫다"}
+
+    def ok(ans):
+        good = isinstance(ans, dict) and isinstance(ans.get("진행"), bool)
+        return good, "" if good else "진행 값이 true/false가 아님"
+
+    ans, who = llm.ask(state, "사전 점검 판단", "precheck_judge.md", data, {"진행": True, "이유": "🟢 통과 (규칙)"}, ok)
+    if not ans["진행"]:
+        pc = {**pc, "신호등": "🟡", "판정": "건너뜀", "이유": pc["이유"] + [f"데이터 담당 판단으로 건너뜀: {ans.get('이유', '')}"]}
+    pc["데이터담당"] = {"진행": ans["진행"], "이유": ans.get("이유", ""), "결정자": who}
+    return pc
+
+
 # ---------------------------------------------------------------- 사전 점검
 def precheck(state, new: dict, old: dict, change: dict) -> dict:
     """모델에 넣기 전에 '할 만한가' 판단. 첫 회차 학습 구간(3~5월) 정답만 보고, 검증월 정답은 보지 않는다."""
